@@ -17,6 +17,7 @@ from collections import OrderedDict
 import torch
 import copy
 import random
+import re
 
 
 
@@ -63,6 +64,203 @@ class Adapter_lora(nn.Module):
         return out
 
 
+class SDLoRAAdapter(nn.Module):
+    is_sd_lora_adapter = True
+
+    def __init__(self,
+                 config=None,
+                 rank=None,
+                 dropout=0.0,
+                 init_option="lora",
+                 adapter_scalar="1.0",
+                 adapter_layernorm_option="in"):
+        super().__init__()
+        self.config = config
+        self.rank = int(rank if rank is not None else config.ffn_num)
+        self.direction_norm_eps = float(getattr(config, "direction_norm_eps", 1e-6))
+        self.normalize_direction = bool(getattr(config, "normalize_direction", True))
+        self.specific_lora_init_scale = float(getattr(config, "specific_lora_init_scale", 1e-3))
+        self.cache_old_directions = bool(getattr(config, "cache_old_directions", True))
+        self.cache_device = getattr(config, "cache_device", "cuda")
+        if self.cache_device not in ("cuda", "cpu"):
+            raise ValueError("sd_lora.cache_device must be 'cuda' or 'cpu', got {}".format(self.cache_device))
+        self.combine_directions_before_linear = bool(
+            getattr(config, "combine_directions_before_linear", False)
+        )
+        self.directions = nn.ModuleList()
+        self.register_buffer(
+            "cached_old_direction_weights",
+            torch.empty(0),
+            persistent=False,
+        )
+        self._cached_old_direction_count = 0
+        self._cache_warning_emitted = set()
+        self._adapter_kwargs = dict(
+            config=config,
+            dropout=dropout,
+            init_option=init_option,
+            adapter_scalar=adapter_scalar,
+            adapter_layernorm_option=adapter_layernorm_option,
+        )
+        self.add_direction(self.rank)
+
+    def add_direction(self, rank):
+        direction = Adapter_lora(
+            bottleneck=int(rank),
+            **self._adapter_kwargs,
+        )
+        with torch.no_grad():
+            nn.init.normal_(direction.lora_A.weight, mean=0.0, std=self.specific_lora_init_scale)
+        direction.requires_grad_(True)
+        self.directions.append(direction)
+        return direction
+
+    def freeze_all_directions(self):
+        for direction in self.directions:
+            direction.requires_grad_(False)
+
+    def set_trainable_current_direction(self):
+        self.freeze_all_directions()
+        if len(self.directions) > 0:
+            self.directions[-1].requires_grad_(True)
+
+    def direction_ranks(self):
+        return [direction.lora_B.weight.shape[0] for direction in self.directions]
+
+    def num_cached_directions(self):
+        return int(self._cached_old_direction_count)
+
+    def current_direction_cached(self):
+        return len(self.directions) > 0 and self.num_cached_directions() >= len(self.directions)
+
+    def clear_cached_old_directions(self):
+        device = self.cached_old_direction_weights.device
+        dtype = self.cached_old_direction_weights.dtype
+        self.cached_old_direction_weights = torch.empty(0, device=device, dtype=dtype)
+        self._cached_old_direction_count = 0
+        self._cache_warning_emitted.clear()
+
+    def _cache_target_device(self):
+        parameter_device = next(self.parameters()).device
+        if self.cache_device == "cpu":
+            return torch.device("cpu")
+        if parameter_device.type == "cuda":
+            return parameter_device
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return parameter_device
+
+    def _direction_weight(self, direction):
+        update_weight = direction.lora_A.weight @ direction.lora_B.weight
+        return update_weight
+
+    def _normalize_direction_weight(self, update_weight):
+        if not self.normalize_direction:
+            # normalize_direction=False -> raw direction D_k = A_k B_k (e.g. baseline).
+            return update_weight
+        denom = torch.norm(update_weight, p="fro") + self.direction_norm_eps
+        return update_weight / denom
+
+    def _normalized_direction_weight(self, direction):
+        return self._normalize_direction_weight(self._direction_weight(direction))
+
+    def cache_frozen_old_directions(self, include_current=False):
+        if not self.cache_old_directions:
+            self.clear_cached_old_directions()
+            return None
+
+        limit = len(self.directions) if include_current else max(len(self.directions) - 1, 0)
+        cached_weights = []
+        target_device = self._cache_target_device()
+        with torch.no_grad():
+            for direction_index in range(limit):
+                direction = self.directions[direction_index]
+                if any(parameter.requires_grad for parameter in direction.parameters()):
+                    break
+                update_weight = self._normalized_direction_weight(direction).detach()
+                cached_weights.append(update_weight.to(device=target_device))
+
+        if len(cached_weights) == 0:
+            self.clear_cached_old_directions()
+            return None
+
+        self.cached_old_direction_weights = torch.stack(cached_weights, dim=0).detach()
+        self._cached_old_direction_count = int(self.cached_old_direction_weights.shape[0])
+        self._cache_warning_emitted.clear()
+        return {
+            "count": self._cached_old_direction_count,
+            "shape": tuple(self.cached_old_direction_weights.shape),
+            "device": str(self.cached_old_direction_weights.device),
+            "dtype": str(self.cached_old_direction_weights.dtype),
+            "requires_grad": bool(self.cached_old_direction_weights.requires_grad),
+        }
+
+    def _cached_direction_weight_for_forward(self, direction_index, x, active_directions):
+        if not self.cache_old_directions:
+            return None
+
+        is_current_direction = direction_index == active_directions - 1
+        if is_current_direction:
+            return None
+
+        if (
+            self.cached_old_direction_weights.numel() > 0
+            and direction_index < self.num_cached_directions()
+        ):
+            return self.cached_old_direction_weights[direction_index].to(
+                device=x.device,
+                dtype=x.dtype,
+                non_blocking=True,
+            )
+
+        if direction_index not in self._cache_warning_emitted:
+            logging.warning(
+                "SD-LoRA old direction cache missing; falling back to A@B. "
+                "direction_index=%s active_directions=%s cached_directions=%s",
+                direction_index,
+                active_directions,
+                self.num_cached_directions(),
+            )
+            self._cache_warning_emitted.add(direction_index)
+        return None
+
+    def _direction_weight_for_forward(self, direction_index, x, active_directions):
+        cached_weight = self._cached_direction_weight_for_forward(
+            direction_index,
+            x,
+            active_directions,
+        )
+        if cached_weight is not None:
+            return cached_weight
+        return self._normalized_direction_weight(self.directions[direction_index]).to(
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+    def forward(self, x, direction_scale):
+        if direction_scale is None:
+            raise ValueError("SDLoRAAdapter requires a direction_scale tensor.")
+        active_directions = min(len(self.directions), direction_scale.shape[0])
+        if self.combine_directions_before_linear:
+            combined_weight = None
+            for direction_index in range(active_directions):
+                update_weight = self._direction_weight_for_forward(direction_index, x, active_directions)
+                scale = direction_scale[direction_index].to(device=x.device, dtype=x.dtype)
+                scaled_weight = scale * update_weight
+                combined_weight = scaled_weight if combined_weight is None else combined_weight + scaled_weight
+            if combined_weight is None:
+                return torch.zeros_like(x)
+            return F.linear(x, combined_weight)
+
+        out = torch.zeros_like(x)
+        for direction_index in range(active_directions):
+            update_weight = self._direction_weight_for_forward(direction_index, x, active_directions)
+            direction_out = F.linear(x, update_weight)
+            scale = direction_scale[direction_index].to(device=direction_out.device, dtype=direction_out.dtype)
+            out = out + scale * direction_out
+        return out
+
+
 class Attention_lora(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., msa = [0,0,0]):
         super().__init__()
@@ -88,7 +286,13 @@ class Attention_lora(nn.Module):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
 
-    def forward(self, x, adapt=None, prompt = None, rank_prompt = None, block_weight = None):
+    def _adapter_forward(self, adapter, x, direction_scale=None):
+        if getattr(adapter, "is_sd_lora_adapter", False):
+            return adapter(x, direction_scale)
+        return adapter(x)
+
+
+    def forward(self, x, adapt=None, prompt = None, rank_prompt = None, block_weight = None, direction_scale=None):
         B, N, C = x.shape
 
         q = self.q_proj(x)
@@ -99,15 +303,15 @@ class Attention_lora(nn.Module):
             if block_weight is not None:
                 block_weight = block_weight
             else:
-                block_weight = torch.ones(3).cuda()
+                block_weight = torch.ones(3, device=x.device, dtype=x.dtype)
             if self.msa[0] == 1:
-                adapt_x = adapt[0](x)
+                adapt_x = self._adapter_forward(adapt[0], x, direction_scale)
                 q += block_weight[0] * adapt_x
             if self.msa[1] == 1:
-                adapt_x = adapt[1](x)
+                adapt_x = self._adapter_forward(adapt[1], x, direction_scale)
                 k += block_weight[1] * adapt_x
             if self.msa[2] == 1:
-                adapt_x = adapt[2](x)
+                adapt_x = self._adapter_forward(adapt[2], x, direction_scale)
                 v += block_weight[2] * adapt_x
 
 
@@ -155,10 +359,10 @@ class Block(nn.Module):
 
 
     # prompt and rank_prmopt can be considerred as potential future improvements by levergaing additional prompt information, but is not implemented in this work
-    def forward(self, x, adapt=None, prompt=None, rank_prompt=None, block_weight=None):
+    def forward(self, x, adapt=None, prompt=None, rank_prompt=None, block_weight=None, direction_scale=None):
         if self.msa_adapt:
             x = x + self.drop_path(
-                self.attn(self.norm1(x), adapt, prompt, rank_prompt, block_weight))
+                self.attn(self.norm1(x), adapt, prompt, rank_prompt, block_weight, direction_scale))
             residual = x
             x = self.mlp_drop(self.act(self.fc1(self.norm2(x))))
             x = self.drop_path(self.mlp_drop(self.fc2(x)))
@@ -192,6 +396,26 @@ class VisionTransformer(nn.Module):
         self.msa_adapt = self.tuning_config.msa_adapt
         self.use_distillation = self.tuning_config.use_distillation
         self.use_block_weight = self.tuning_config.use_block_weight
+        self.direction_scale_init = float(getattr(self.tuning_config, "direction_scale_init", 0.05))
+        self.block_weight_norm_eps = float(getattr(self.tuning_config, "block_weight_norm_eps", 1e-6))
+        self.block_weight_normalization = getattr(self.tuning_config, "block_weight_normalization", "mean_l1")
+        # SD-LoRA-RR task-specific adapter settings
+        self.sd_lora_enable = bool(getattr(self.tuning_config, "sd_lora_enable", True))
+        self.sd_lora_variant = getattr(self.tuning_config, "sd_lora_variant", "rr")
+        self.sd_lora_r0 = int(getattr(self.tuning_config, "sd_lora_r0", self.tuning_config.ffn_num))
+        self.sd_lora_r_min = int(getattr(self.tuning_config, "sd_lora_r_min", 1))
+        self.sd_lora_rank_decay = float(getattr(self.tuning_config, "sd_lora_rank_decay", 1.0))
+        self.normalize_direction = bool(getattr(self.tuning_config, "normalize_direction", True))
+        self.alpha_mode = getattr(self.tuning_config, "alpha_mode", "task_conditioned")
+        self.train_old_alpha = bool(getattr(self.tuning_config, "train_old_alpha", False))
+        self.cache_old_directions = bool(getattr(self.tuning_config, "cache_old_directions", True))
+        self.cache_device = getattr(self.tuning_config, "cache_device", "cuda")
+        if self.cache_device not in ("cuda", "cpu"):
+            raise ValueError("sd_lora.cache_device must be 'cuda' or 'cpu', got {}".format(self.cache_device))
+        self.combine_directions_before_linear = bool(
+            getattr(self.tuning_config, "combine_directions_before_linear", False)
+        )
+        self.current_task_index = 0
 
         if self.msa_adapt:
             self.msa = self.tuning_config.msa
@@ -206,10 +430,20 @@ class VisionTransformer(nn.Module):
             self.old_adapter_list = nn.ModuleList()
 
         if self.use_block_weight:
-            self.block_weight_list = []
+            self.block_weight_list = nn.ParameterList()
             self.block_weight = nn.Parameter(torch.randn(3, len(self.specfic_pos)))
             nn.init.uniform_(self.block_weight, .5, 1.5)
 
+        self.direction_scale_list = nn.ParameterList()
+        self.direction_scale = nn.Parameter(
+            torch.full((len(self.specfic_pos), 1), self.direction_scale_init),
+            requires_grad=self.sd_lora_enable,
+        )
+        self.current_specific_rank = self.get_specific_lora_rank(0)
+        self.register_buffer(
+            "specific_lora_rank_history_buffer",
+            torch.tensor([self.current_specific_rank], dtype=torch.long),
+        )
 
         self.patch_embed = embed_layer(
             img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -265,11 +499,426 @@ class VisionTransformer(nn.Module):
 
         self.config = tuning_config
         self._device = tuning_config._device
-        self.adapter_list = []
+        self.adapter_list = nn.ModuleList()
         self.adapter_pos_list = []
         self.cur_adapter = nn.ModuleList()
         if self.msa_adapt:
             self.get_new_adapter_initial_msa()
+
+    def get_specific_lora_rank(self, task_id):
+        # SD-LoRA-RR rank schedule for the task-specific adapter.
+        # task_id is zero-based: task_id=0 -> first task (t=1).
+        if not self.sd_lora_enable:
+            # Experiment A baseline: original CL-LoRA, one fixed-rank direction per task.
+            return self.sd_lora_r0
+        if self.sd_lora_variant == "fixed":
+            # Experiment B: fixed-rank SD-LoRA, every new direction keeps r0.
+            return self.sd_lora_r0
+        if self.sd_lora_variant == "rr":
+            # Experiment C/D: r_t = max(r_min, floor(r0 * decay^(t-1)))
+            decayed = int(math.floor(self.sd_lora_r0 * (self.sd_lora_rank_decay ** task_id)))
+            return max(self.sd_lora_r_min, decayed)
+
+        # Legacy milestone-based schedule fallback (kept for backward compatibility).
+        schedule = getattr(self.tuning_config, "specific_lora_rank_schedule", None)
+        default_rank = int(self.tuning_config.ffn_num)
+        if not schedule:
+            return default_rank
+
+        milestones = list(schedule.get("milestones", []))
+        ranks = list(schedule.get("ranks", [default_rank]))
+        if len(ranks) != len(milestones) + 1:
+            raise ValueError("specific_lora_rank_schedule.ranks must have len(milestones) + 1 entries.")
+
+        rank = int(ranks[0])
+        if len(milestones) > 0 and all(isinstance(m, float) and m <= 1.0 for m in milestones):
+            nb_tasks = max(int(getattr(self.tuning_config, "nb_tasks", 1)), 1)
+            denominator = max(nb_tasks - 1, 1)
+            progress = float(task_id) / denominator
+            for milestone, next_rank in zip(milestones, ranks[1:]):
+                if progress >= float(milestone):
+                    rank = int(next_rank)
+        else:
+            for milestone, next_rank in zip(milestones, ranks[1:]):
+                if task_id >= int(milestone):
+                    rank = int(next_rank)
+        return rank
+
+    def _new_direction_scale(self, previous_scale=None):
+        if previous_scale is None:
+            values = torch.full((len(self.specfic_pos), 1), self.direction_scale_init)
+        else:
+            inherited = previous_scale.detach().clone()
+            if inherited.dim() == 1:
+                inherited = inherited.unsqueeze(0).repeat(len(self.specfic_pos), 1)
+            new_value = inherited.new_full((inherited.shape[0], 1), self.direction_scale_init)
+            values = torch.cat([inherited, new_value], dim=1)
+        return nn.Parameter(values, requires_grad=self.sd_lora_enable)
+
+    def _new_block_weight(self):
+        block_weight = nn.Parameter(torch.randn(3, len(self.specfic_pos)))
+        nn.init.uniform_(block_weight, .5, 1.5)
+        return block_weight
+
+    def _set_specific_lora_rank_history(self, ranks):
+        device = self.specific_lora_rank_history_buffer.device
+        self.specific_lora_rank_history_buffer = torch.tensor(
+            [int(rank) for rank in ranks],
+            dtype=torch.long,
+            device=device,
+        )
+
+    def _specific_lora_rank_history(self):
+        return [int(rank) for rank in self.specific_lora_rank_history_buffer.detach().cpu().tolist()]
+
+    def normalize_block_weight(self, block_weight):
+        if self.block_weight_normalization in [None, "none", "None"]:
+            return block_weight
+        if self.block_weight_normalization == "mean_l1":
+            denom = block_weight.abs().mean() + self.block_weight_norm_eps
+        elif self.block_weight_normalization == "l2":
+            denom = torch.norm(block_weight.flatten(), p=2) + self.block_weight_norm_eps
+        elif self.block_weight_normalization == "l1":
+            denom = torch.norm(block_weight.flatten(), p=1) + self.block_weight_norm_eps
+        else:
+            raise ValueError("Unsupported block_weight_normalization: {}".format(self.block_weight_normalization))
+        return block_weight / denom
+
+    def _get_block_weight_column(self, block_weight, pos_spec):
+        return self.normalize_block_weight(block_weight)[:, pos_spec]
+
+    def _snapshot_parameter(self, parameter):
+        return nn.Parameter(parameter.detach().clone(), requires_grad=False)
+
+    def _set_specific_trainable_state(self):
+        for block_idx in self.specfic_pos:
+            pos = self.adapt_pos.index(block_idx)
+            for adapter in self.cur_adapter[pos]:
+                if getattr(adapter, "is_sd_lora_adapter", False):
+                    adapter.set_trainable_current_direction()
+
+    def _apply_alpha_mode_requires_grad(self):
+        if not self.sd_lora_enable:
+            self.direction_scale.requires_grad = False
+            for parameter in self.direction_scale_list:
+                parameter.requires_grad = False
+            return
+        # The current-task routing alpha (self.direction_scale) is always trainable:
+        #   - global mode: it holds the single shared alpha_1..alpha_t (all trainable);
+        #   - task_conditioned mode: it is the current branch routing alpha_{t,1:t}.
+        self.direction_scale.requires_grad = True
+        # Old-task routing snapshots stay frozen unless train_old_alpha is set, so the
+        # old task's prototype space is not perturbed by later tasks.
+        for parameter in self.direction_scale_list:
+            parameter.requires_grad = bool(self.train_old_alpha)
+
+    def _select_direction_scale_for_block(self, direction_scale, pos_spec):
+        if direction_scale is None:
+            return None
+        if direction_scale.dim() == 1:
+            return direction_scale
+        return direction_scale[pos_spec]
+
+    def _inference_direction_scale(self, task_index, pos_spec):
+        if self.alpha_mode == "global":
+            # Global alpha: all task branches share the latest routing vector prefix.
+            return self._select_direction_scale_for_block(
+                self.direction_scale,
+                pos_spec,
+            )[: task_index + 1]
+        # task_conditioned: each branch uses its own saved (frozen) routing snapshot.
+        return self._select_direction_scale_for_block(
+            self.direction_scale_list[task_index],
+            pos_spec,
+        )
+
+    def _get_general_adapter_for_snapshot(self, task_index, block_index):
+        pos = self.adapt_pos.index(block_index)
+        if self.use_distillation and task_index < len(self.old_adapter_list):
+            return self.old_adapter_list[task_index][pos]
+        return self.cur_adapter[pos]
+
+    def _current_sd_lora_adapters(self):
+        adapters = []
+        if not self.msa_adapt:
+            return adapters
+        for block_idx in self.specfic_pos:
+            pos = self.adapt_pos.index(block_idx)
+            for adapter in self.cur_adapter[pos]:
+                if getattr(adapter, "is_sd_lora_adapter", False):
+                    adapters.append(adapter)
+        return adapters
+
+    def cache_current_old_directions(self):
+        if not self.sd_lora_enable or not self.cache_old_directions:
+            return []
+        summaries = []
+        for adapter in self._current_sd_lora_adapters():
+            summary = adapter.cache_frozen_old_directions(include_current=False)
+            if summary is not None:
+                summaries.append(summary)
+        return summaries
+
+    def log_sd_lora_cache_state(self):
+        adapters = self._current_sd_lora_adapters()
+        num_cached_directions = sum(adapter.num_cached_directions() for adapter in adapters)
+        current_direction_cached = any(adapter.current_direction_cached() for adapter in adapters)
+        logging.info(
+            "[SD-LoRA Cache]\n"
+            "cache_old_directions: %s\n"
+            "cache_device: %s\n"
+            "num_cached_directions: %s\n"
+            "current_direction_cached: %s\n"
+            "combine_directions_before_linear: %s",
+            self.cache_old_directions,
+            self.cache_device,
+            num_cached_directions,
+            current_direction_cached,
+            self.combine_directions_before_linear,
+        )
+
+    def log_sd_lora_cache_saved(self, task_id, summaries):
+        if len(summaries) == 0:
+            return
+        first = summaries[0]
+        logging.info(
+            "[SD-LoRA Cache Saved]\n"
+            "task_id: %s\n"
+            "num_layers: %s\n"
+            "num_positions: %s\n"
+            "cached_weight_shape: %s\n"
+            "device: %s\n"
+            "dtype: %s\n"
+            "requires_grad: %s",
+            task_id,
+            len(self.specfic_pos),
+            len(summaries),
+            first["shape"],
+            first["device"],
+            first["dtype"],
+            first["requires_grad"],
+        )
+
+    def log_sd_lora_rr_state(self):
+        direction_ranks = []
+        current_direction_params = 0
+        old_directions_frozen = True
+        current_adapter = None
+        if self.msa_adapt and len(self.specfic_pos) > 0:
+            current_adapter = self.cur_adapter[self.adapt_pos.index(self.specfic_pos[0])][0]
+            if getattr(current_adapter, "is_sd_lora_adapter", False):
+                direction_ranks = current_adapter.direction_ranks()
+                # parameter count of the newly added (current) direction
+                current_direction_params = sum(
+                    p.numel() for p in current_adapter.directions[-1].parameters()
+                )
+                # whether every direction except the last is frozen
+                for direction in current_adapter.directions[:-1]:
+                    if any(p.requires_grad for p in direction.parameters()):
+                        old_directions_frozen = False
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.parameters())
+        use_orth = bool(getattr(self.tuning_config, "use_orthogonal_constraint", False))
+        old_alpha_grad = [bool(p.requires_grad) for p in self.direction_scale_list]
+        logging.info(
+            "SD-LoRA-RR | task_id=%s enable=%s variant=%s alpha_mode=%s train_old_alpha=%s "
+            "new_rank=%s direction_ranks=%s new_direction_params=%s old_directions_frozen=%s "
+            "alpha_shape=%s alpha_requires_grad=%s old_alpha_requires_grad=%s "
+            "normalize_direction=%s use_block_weight=%s use_orth_loss=%s "
+            "total_params=%s trainable_params=%s",
+            self.current_task_index,
+            self.sd_lora_enable,
+            self.sd_lora_variant,
+            self.alpha_mode,
+            self.train_old_alpha,
+            self.current_specific_rank,
+            direction_ranks,
+            current_direction_params,
+            old_directions_frozen,
+            tuple(self.direction_scale.shape),
+            bool(self.direction_scale.requires_grad),
+            old_alpha_grad,
+            self.normalize_direction,
+            self.use_block_weight,
+            use_orth,
+            total_params,
+            trainable_params,
+        )
+        self.log_sd_lora_cache_state()
+
+    def _snapshot_indices_in_state_dict(self, state_dict, prefix):
+        indices = set()
+        pattern = re.compile(r"^{}(\d+)".format(re.escape(prefix)))
+        for key in state_dict.keys():
+            match = pattern.match(key)
+            if match:
+                indices.add(int(match.group(1)))
+        return sorted(indices)
+
+    def _direction_ranks_from_state_dict(self, state_dict, prefix):
+        ranks = {}
+        pattern = re.compile(r"^{}directions\.(\d+)\.lora_B\.weight$".format(re.escape(prefix)))
+        for key, value in state_dict.items():
+            match = pattern.match(key)
+            if match:
+                ranks[int(match.group(1))] = int(value.shape[0])
+        return [rank for _, rank in sorted(ranks.items())]
+
+    def _make_sd_adapter_from_ranks(self, ranks, trainable_current):
+        if len(ranks) == 0:
+            ranks = [self.current_specific_rank]
+        adapter = SDLoRAAdapter(
+            self.config,
+            rank=ranks[0],
+            dropout=0.0,
+            init_option=self.config.ffn_adapter_init_option,
+            adapter_scalar=self.config.ffn_adapter_scalar,
+            adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
+        ).to(self._device)
+        while len(adapter.directions) < len(ranks):
+            adapter.add_direction(ranks[len(adapter.directions)])
+        if trainable_current:
+            adapter.set_trainable_current_direction()
+        else:
+            adapter.freeze_all_directions()
+        return adapter
+
+    def _make_standard_adapter_from_state_dict(self, state_dict, prefix, trainable):
+        rank = int(state_dict[prefix + "lora_B.weight"].shape[0])
+        adapter = Adapter_lora(
+            self.config,
+            dropout=0.0,
+            bottleneck=rank,
+            init_option=self.config.ffn_adapter_init_option,
+            adapter_scalar=self.config.ffn_adapter_scalar,
+            adapter_layernorm_option=self.config.ffn_adapter_layernorm_option,
+        ).to(self._device)
+        adapter.requires_grad_(trainable)
+        return adapter
+
+    def _rebuild_current_adapters_from_state_dict(self, state_dict):
+        if "direction_scale" in state_dict:
+            self.direction_scale = nn.Parameter(torch.zeros_like(state_dict["direction_scale"]))
+            self.current_task_index = max(int(state_dict["direction_scale"].shape[-1]) - 1, 0)
+
+        if "block_weight" in state_dict:
+            self.block_weight = nn.Parameter(torch.zeros_like(state_dict["block_weight"]))
+
+        rank_history = None
+        for block_idx in self.specfic_pos:
+            pos = self.adapt_pos.index(block_idx)
+            temp_adapter = nn.ModuleList()
+            for msa_idx, msa_enabled in enumerate(self.msa):
+                if msa_enabled == 1:
+                    ranks = self._direction_ranks_from_state_dict(
+                        state_dict,
+                        "cur_adapter.{}.{}.".format(pos, msa_idx),
+                    )
+                    adapter = self._make_sd_adapter_from_ranks(ranks, trainable_current=True)
+                    if rank_history is None:
+                        rank_history = ranks
+                else:
+                    adapter = nn.Identity()
+                temp_adapter.append(adapter)
+            self.cur_adapter[pos] = temp_adapter
+
+        if rank_history:
+            self._set_specific_lora_rank_history(rank_history)
+            self.current_specific_rank = rank_history[-1]
+
+        if "specific_lora_rank_history_buffer" in state_dict:
+            self.specific_lora_rank_history_buffer = torch.zeros_like(
+                state_dict["specific_lora_rank_history_buffer"]
+            )
+
+    def _rebuild_snapshot_adapters_from_state_dict(self, state_dict):
+        adapter_indices = self._snapshot_indices_in_state_dict(state_dict, "adapter_list.")
+        self.adapter_list = nn.ModuleList()
+        for snapshot_idx in adapter_indices:
+            snapshot_adapters = []
+            for spec_idx in range(len(self.specfic_pos)):
+                temp_adapter = nn.ModuleList()
+                for msa_idx, msa_enabled in enumerate(self.msa):
+                    if msa_enabled == 1:
+                        ranks = self._direction_ranks_from_state_dict(
+                            state_dict,
+                            "adapter_list.{}.{}.{}.".format(snapshot_idx, spec_idx, msa_idx),
+                        )
+                        adapter = self._make_sd_adapter_from_ranks(ranks, trainable_current=False)
+                    else:
+                        adapter = nn.Identity()
+                    temp_adapter.append(adapter)
+                snapshot_adapters.append(temp_adapter)
+            self.adapter_list.append(nn.ModuleList(snapshot_adapters).requires_grad_(False))
+
+    def _rebuild_old_adapters_from_state_dict(self, state_dict):
+        if not self.use_distillation:
+            return
+        old_indices = self._snapshot_indices_in_state_dict(state_dict, "old_adapter_list.")
+        self.old_adapter_list = nn.ModuleList()
+        for snapshot_idx in old_indices:
+            snapshot = nn.ModuleList()
+            for pos, block_idx in enumerate(self.adapt_pos):
+                temp_adapter = nn.ModuleList()
+                for msa_idx, msa_enabled in enumerate(self.msa):
+                    if msa_enabled == 1:
+                        prefix = "old_adapter_list.{}.{}.{}.".format(snapshot_idx, pos, msa_idx)
+                        if block_idx in self.specfic_pos:
+                            ranks = self._direction_ranks_from_state_dict(state_dict, prefix)
+                            adapter = self._make_sd_adapter_from_ranks(ranks, trainable_current=False)
+                        else:
+                            adapter = self._make_standard_adapter_from_state_dict(state_dict, prefix, trainable=False)
+                    else:
+                        adapter = nn.Identity()
+                    temp_adapter.append(adapter)
+                snapshot.append(temp_adapter)
+            self.old_adapter_list.append(snapshot.requires_grad_(False))
+
+    def _rebuild_parameter_snapshots_from_state_dict(self, state_dict):
+        self.block_weight_list = nn.ParameterList()
+        for snapshot_idx in self._snapshot_indices_in_state_dict(state_dict, "block_weight_list."):
+            key = "block_weight_list.{}".format(snapshot_idx)
+            self.block_weight_list.append(nn.Parameter(torch.zeros_like(state_dict[key]), requires_grad=False))
+
+        self.direction_scale_list = nn.ParameterList()
+        for snapshot_idx in self._snapshot_indices_in_state_dict(state_dict, "direction_scale_list."):
+            key = "direction_scale_list.{}".format(snapshot_idx)
+            self.direction_scale_list.append(nn.Parameter(torch.zeros_like(state_dict[key]), requires_grad=False))
+
+    def _rebuild_sd_lora_rr_from_state_dict(self, state_dict):
+        if "direction_scale" not in state_dict:
+            return
+        self._rebuild_current_adapters_from_state_dict(state_dict)
+        self._rebuild_snapshot_adapters_from_state_dict(state_dict)
+        self._rebuild_old_adapters_from_state_dict(state_dict)
+        self._rebuild_parameter_snapshots_from_state_dict(state_dict)
+
+    def _restore_requires_grad_after_load(self):
+        for parameter in self.adapter_list.parameters():
+            parameter.requires_grad = False
+        if hasattr(self, "old_adapter_list"):
+            for parameter in self.old_adapter_list.parameters():
+                parameter.requires_grad = False
+        if hasattr(self, "block_weight_list"):
+            for parameter in self.block_weight_list:
+                parameter.requires_grad = False
+        if hasattr(self, "block_weight"):
+            self.block_weight.requires_grad = True
+        self._apply_alpha_mode_requires_grad()
+        self._set_specific_trainable_state()
+
+    def load_state_dict(self, state_dict, strict=True):
+        if strict and "direction_scale" not in state_dict:
+            raise RuntimeError(
+                "This checkpoint does not contain SD-LoRA-RR state. "
+                "It appears to be a pre-SD-LoRA-RR CL-LoRA checkpoint and cannot restore "
+                "task-specific direction scales or adapter snapshots."
+            )
+        self._rebuild_sd_lora_rr_from_state_dict(state_dict)
+        incompatible_keys = super().load_state_dict(state_dict, strict=strict)
+        if "direction_scale" in state_dict:
+            self._restore_requires_grad_after_load()
+        return incompatible_keys
 
     def init_weights(self, mode=''):
         raise NotImplementedError()
@@ -304,18 +953,29 @@ class VisionTransformer(nn.Module):
             for i in range(len(self.adapt_pos)):
                 temp_adapter = nn.ModuleList()
                 for j in self.msa:
-                    if j ==1:
-                        adapter = Adapter_lora(self.config, dropout=0.0, bottleneck=config.ffn_num,
-                                                init_option=config.ffn_adapter_init_option,
-                                                adapter_scalar=config.ffn_adapter_scalar,
-                                                adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                                ).to(self._device)
+                    if j == 1:
+                        if self.adapt_pos[i] in self.specfic_pos and self.sd_lora_enable:
+                            adapter = SDLoRAAdapter(self.config,
+                                                   rank=self.current_specific_rank,
+                                                   dropout=0.0,
+                                                   init_option=config.ffn_adapter_init_option,
+                                                   adapter_scalar=config.ffn_adapter_scalar,
+                                                   adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                   ).to(self._device)
+                        else:
+                            adapter_rank = self.current_specific_rank if self.adapt_pos[i] in self.specfic_pos else config.ffn_num
+                            adapter = Adapter_lora(self.config, dropout=0.0, bottleneck=adapter_rank,
+                                                    init_option=config.ffn_adapter_init_option,
+                                                    adapter_scalar=config.ffn_adapter_scalar,
+                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                    ).to(self._device)
                     else:
                         adapter = nn.Identity()
                     temp_adapter.append(adapter)
 
                 self.cur_adapter.append(temp_adapter)
             self.cur_adapter.requires_grad_(True)
+            self._set_specific_trainable_state()
 
         else:
             print("====Not use adapter===")
@@ -329,12 +989,29 @@ class VisionTransformer(nn.Module):
                 temp_adapter = nn.ModuleList()
                 for j in self.msa:
                     if j == 1:
-                        adapter = Adapter_lora(self.config, dropout=0.0, bottleneck=config.ffn_num,
-                                               init_option=config.ffn_adapter_init_option,
-                                               adapter_scalar=config.ffn_adapter_scalar,
-                                               adapter_layernorm_option=config.ffn_adapter_layernorm_option,
-                                               ).to(self._device)
-                        adapter.requires_grad_(True)
+                        previous_adapter = self.cur_adapter[pos][len(temp_adapter)]
+                        if self.sd_lora_enable and getattr(previous_adapter, "is_sd_lora_adapter", False):
+                            # SD-LoRA: accumulate directions, freeze old ones, train new one.
+                            adapter = copy.deepcopy(previous_adapter).to(self._device)
+                            adapter.freeze_all_directions()
+                            adapter.add_direction(self.current_specific_rank)
+                            adapter.set_trainable_current_direction()
+                        elif self.sd_lora_enable:
+                            adapter = SDLoRAAdapter(self.config,
+                                                   rank=self.current_specific_rank,
+                                                   dropout=0.0,
+                                                   init_option=config.ffn_adapter_init_option,
+                                                   adapter_scalar=config.ffn_adapter_scalar,
+                                                   adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                   ).to(self._device)
+                        else:
+                            adapter = Adapter_lora(self.config,
+                                                   dropout=0.0,
+                                                   bottleneck=self.current_specific_rank,
+                                                   init_option=config.ffn_adapter_init_option,
+                                                   adapter_scalar=config.ffn_adapter_scalar,
+                                                   adapter_layernorm_option=config.ffn_adapter_layernorm_option,
+                                                   ).to(self._device)
                     else:
                         adapter = nn.Identity()
                     temp_adapter.append(adapter)
@@ -349,22 +1026,31 @@ class VisionTransformer(nn.Module):
                         for j in range(len(self.msa)):
                             if self.msa[j] == 1:
                                 self.cur_adapter[pos][j].lora_B.requires_grad_(False)
+                self._set_specific_trainable_state()
         else:
             print("====Not use adapter===")
 
 
     def add_adapter_to_list(self):
+        completed_task_id = self.current_task_index
         temp_adapter = []
         for i in range(len(self.specfic_pos)):
             temp_pos = self.adapt_pos.index(self.specfic_pos[i])
             temp_adapter.append(copy.deepcopy(self.cur_adapter[temp_pos].requires_grad_(False)))
-        self.adapter_list.append(temp_adapter)
+        self.adapter_list.append(nn.ModuleList(temp_adapter))
 
         if self.use_block_weight:
-            self.block_weight_old = copy.deepcopy(self.block_weight)
-            self.block_weight_list.append(self.block_weight_old.requires_grad_(False))
-            self.block_weight = nn.Parameter(torch.randn(3, len(self.specfic_pos)))
-            nn.init.uniform_(self.block_weight, .5, 1.5)
+            self.block_weight_list.append(self._snapshot_parameter(self.block_weight))
+            self.block_weight = self._new_block_weight()
+
+        self.direction_scale_list.append(self._snapshot_parameter(self.direction_scale))
+        previous_direction_scale = self.direction_scale
+        self.current_task_index += 1
+        self.current_specific_rank = self.get_specific_lora_rank(self.current_task_index)
+        rank_history = self._specific_lora_rank_history()
+        rank_history.append(self.current_specific_rank)
+        self._set_specific_lora_rank_history(rank_history)
+        self.direction_scale = self._new_direction_scale(previous_direction_scale)
 
 
         self.adapter_pos_list.append(self.adapt_pos)
@@ -373,6 +1059,10 @@ class VisionTransformer(nn.Module):
             self.old_adapter_list.append(copy.deepcopy(self.cur_adapter).requires_grad_(False))
         if self.msa_adapt:
             self.get_new_adapter_msa()
+        self._apply_alpha_mode_requires_grad()
+        cache_summaries = self.cache_current_old_directions()
+        self.log_sd_lora_cache_saved(completed_task_id, cache_summaries)
+        self.log_sd_lora_rr_state()
 
     def forward_train(self, x):
         B = x.shape[0]
@@ -395,10 +1085,13 @@ class VisionTransformer(nn.Module):
                 if idx in self.adapt_pos:
                     pos = self.adapt_pos.index(idx)
                     block_weight = None
-                    if self.use_block_weight and idx in self.specfic_pos:
+                    if idx in self.specfic_pos:
                         pos_spec = self.specfic_pos.index(idx)
+                        if self.use_block_weight:
+                            block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
                         x = blk(x, self.cur_adapter[pos], prompt, rank_prompt,
-                                block_weight=self.block_weight[:, pos_spec])
+                                block_weight=block_weight,
+                                direction_scale=self._select_direction_scale_for_block(self.direction_scale, pos_spec))
                     else:
                         x = blk(x, self.cur_adapter[pos], prompt, rank_prompt, block_weight=None)
                 else:
@@ -443,18 +1136,19 @@ class VisionTransformer(nn.Module):
 
                     if j in self.adapt_pos:
                         if j in self.general_pos:
-                            pos = self.adapt_pos.index(j)
-                            adapt = self.cur_adapter[pos]
+                            adapt = self._get_general_adapter_for_snapshot(i, j)
+                            direction_scale = None
                         else:
                             pos = self.specfic_pos.index(j)
                             adapt = self.adapter_list[i][pos]
+                            direction_scale = self._inference_direction_scale(i, pos)
 
                         if self.use_block_weight and j in self.specfic_pos:
                             pos_spec = self.specfic_pos.index(j)
-                            block_weight = self.block_weight_list[i][:, pos_spec]
+                            block_weight = self._get_block_weight_column(self.block_weight_list[i], pos_spec)
                         else:
                             block_weight = None
-                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight)
+                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight, direction_scale)
 
                     else:
                         x = self.blocks[j](x, adapt=None, prompt=prompt, rank_prompt=rank_prompt, block_weight=None)
@@ -471,12 +1165,17 @@ class VisionTransformer(nn.Module):
                 if i in self.adapt_pos:
                     pos = self.adapt_pos.index(i)
                     adapt = self.cur_adapter[pos]
-                    if self.use_block_weight and i in self.specfic_pos:
+                    if i in self.specfic_pos:
                         pos_spec = self.specfic_pos.index(i)
-                        block_weight = self.block_weight[:, pos_spec]
+                        if self.use_block_weight:
+                            block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
+                        else:
+                            block_weight = None
+                        direction_scale = self._select_direction_scale_for_block(self.direction_scale, pos_spec)
                     else:
                         block_weight = None
-                    x = self.blocks[i](x, adapt, prompt, rank_prompt, block_weight)
+                        direction_scale = None
+                    x = self.blocks[i](x, adapt, prompt, rank_prompt, block_weight, direction_scale)
                 else:
                     x = self.blocks[i](x, adapt=None, prompt=prompt, rank_prompt=rank_prompt, block_weight=None)
             x = self.norm(x)
@@ -528,17 +1227,18 @@ class VisionTransformer(nn.Module):
 
                     if j in self.adapt_pos:
                         if j in self.general_pos:
-                            pos = self.adapt_pos.index(j)
-                            adapt = self.cur_adapter[pos]
+                            adapt = self._get_general_adapter_for_snapshot(i, j)
+                            direction_scale = None
                         else:
                             pos = self.specfic_pos.index(j)
                             adapt = self.adapter_list[i][pos]
+                            direction_scale = self._inference_direction_scale(i, pos)
                         if self.use_block_weight and j in self.specfic_pos:
                             pos_spec = self.specfic_pos.index(j)
-                            block_weight = self.block_weight_list[i][:, pos_spec]
+                            block_weight = self._get_block_weight_column(self.block_weight_list[i], pos_spec)
                         else:
                             block_weight = None
-                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight)
+                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight, direction_scale)
 
                     else:
                         x = self.blocks[j](x, adapt=None, prompt=prompt, rank_prompt=rank_prompt, block_weight=None)
@@ -550,13 +1250,18 @@ class VisionTransformer(nn.Module):
                     if j in self.adapt_pos:
                         pos = self.adapt_pos.index(j)
                         adapt = self.cur_adapter[pos]
-                        if self.use_block_weight and j in self.specfic_pos:
+                        if j in self.specfic_pos:
                             pos_spec = self.specfic_pos.index(j)
-                            block_weight = self.block_weight[:, pos_spec]
+                            if self.use_block_weight:
+                                block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
+                            else:
+                                block_weight = None
+                            direction_scale = self._select_direction_scale_for_block(self.direction_scale, pos_spec)
                         else:
                             block_weight = None
+                            direction_scale = None
 
-                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight)
+                        x = self.blocks[j](x, adapt, prompt, rank_prompt, block_weight, direction_scale)
                     else:
                         x = self.blocks[j](x, adapt=None, prompt=prompt, rank_prompt=rank_prompt, block_weight=None)
         else:
@@ -644,20 +1349,19 @@ def vit_base_patch16_224_cllora(pretrained=False, **kwargs):
 
     if not model.msa_adapt:
         for adapter_temp in model.cur_adapter:
-            #for adapter in adapter_temp:
             for param in adapter_temp.lora_B.parameters():
                 param.requires_grad = False
     else:
         for i in model.adapt_pos:
-            #if i in model.general_pos:
             if i in model.general_pos:
                 pos = model.adapt_pos.index(i)
                 for j in range(len(model.msa)):
                     if model.msa[j] == 1:
-                    #for adapter in adapter_temp:
                         for param in model.cur_adapter[pos][j].lora_B.parameters():
                             param.requires_grad = False
-    #
+
+    model._apply_alpha_mode_requires_grad()
+    model._set_specific_trainable_state()
     return model
 
 def vit_base_patch16_224_in21k_cllora(pretrained=False, **kwargs):
@@ -703,20 +1407,19 @@ def vit_base_patch16_224_in21k_cllora(pretrained=False, **kwargs):
 
     if not model.msa_adapt:
         for adapter_temp in model.cur_adapter:
-            #for adapter in adapter_temp:
             for param in adapter_temp.lora_B.parameters():
                 param.requires_grad = False
     else:
         for i in model.adapt_pos:
-            #if i in model.general_pos:
             if i in model.general_pos:
                 pos = model.adapt_pos.index(i)
                 for j in range(len(model.msa)):
                     if model.msa[j] == 1:
-                    #for adapter in adapter_temp:
                         for param in model.cur_adapter[pos][j].lora_B.parameters():
                             param.requires_grad = False
 
+    model._apply_alpha_mode_requires_grad()
+    model._set_specific_trainable_state()
     return model
 
 

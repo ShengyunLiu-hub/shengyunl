@@ -7,6 +7,41 @@ from backbone.prompt import CodaPrompt
 import timm
 import math
 
+def parse_cllora_adapter_options(args, ffn_num):
+    # Prefer nested "sd_lora" / "task_specific_adapter" blocks. If no sd_lora
+    # block is present, keep legacy CL-LoRA behavior instead of enabling SD-LoRA.
+    sd_cfg = args.get("sd_lora", {}) or {}
+    tsa_cfg = args.get("task_specific_adapter", {}) or {}
+    has_sd_block = bool(args.get("sd_lora"))
+
+    sd_lora_enable = bool(sd_cfg.get("enable", has_sd_block))
+    if "variant" in sd_cfg:
+        sd_lora_variant = sd_cfg["variant"]
+    elif not sd_lora_enable and args.get("specific_lora_rank_schedule"):
+        sd_lora_variant = "legacy"
+    elif sd_lora_enable:
+        sd_lora_variant = "rr"
+    else:
+        sd_lora_variant = "fixed"
+
+    return {
+        "sd_lora_enable": sd_lora_enable,
+        "sd_lora_variant": sd_lora_variant,
+        "sd_lora_r0": int(sd_cfg.get("r0", ffn_num)),
+        "sd_lora_r_min": int(sd_cfg.get("r_min", 1)),
+        "sd_lora_rank_decay": float(sd_cfg.get("rank_decay", 1.0)),
+        "normalize_direction": bool(sd_cfg.get("normalize_direction", True)),
+        "alpha_mode": sd_cfg.get("alpha_mode", "task_conditioned"),
+        "train_old_alpha": bool(sd_cfg.get("train_old_alpha", False)),
+        "alpha_init": float(sd_cfg.get("alpha_init", args.get("direction_scale_init", 0.05))),
+        "direction_norm_eps": float(sd_cfg.get("direction_norm_eps", args.get("direction_norm_eps", 1e-6))),
+        "cache_old_directions": bool(sd_cfg.get("cache_old_directions", True)),
+        "cache_device": sd_cfg.get("cache_device", "cuda"),
+        "combine_directions_before_linear": bool(sd_cfg.get("combine_directions_before_linear", False)),
+        "use_block_weight": bool(tsa_cfg.get("use_block_weight", args.get("use_block_weight", True))),
+        "use_orth_loss": bool(tsa_cfg.get("use_orth_loss", args.get("use_orthogonal_constraint", False))),
+    }
+
 def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
     # SimpleCIL or SimpleCIL w/ Finetune
@@ -206,14 +241,38 @@ def get_backbone(args, pretrained=False):
         if args["model_name"] == "cllora" :
             from backbone import vit_cllora
             from easydict import EasyDict
+
+            adapter_options = parse_cllora_adapter_options(args, ffn_num)
+
             tuning_config = EasyDict(
                 # AdaptFormer
                 use_distillation = args["use_distillation"],
-                use_block_weight = args["use_block_weight"],
+                use_block_weight = adapter_options["use_block_weight"],
+                use_orthogonal_constraint=adapter_options["use_orth_loss"],
+                orthogonal_lambda=args.get("orthogonal_lambda", 0.0),
                 msa_adapt = args["msa_adapt"],
                 msa = args["msa"],
                 specfic_pos = args["specfic_pos"],
                 general_pos = args["general_pos"],
+                specific_lora_rank_schedule=args.get("specific_lora_rank_schedule", None),
+                # SD-LoRA-RR task-specific adapter
+                sd_lora_enable=adapter_options["sd_lora_enable"],
+                sd_lora_variant=adapter_options["sd_lora_variant"],
+                sd_lora_r0=adapter_options["sd_lora_r0"],
+                sd_lora_r_min=adapter_options["sd_lora_r_min"],
+                sd_lora_rank_decay=adapter_options["sd_lora_rank_decay"],
+                normalize_direction=adapter_options["normalize_direction"],
+                alpha_mode=adapter_options["alpha_mode"],
+                train_old_alpha=adapter_options["train_old_alpha"],
+                direction_scale_init=adapter_options["alpha_init"],
+                direction_norm_eps=adapter_options["direction_norm_eps"],
+                cache_old_directions=adapter_options["cache_old_directions"],
+                cache_device=adapter_options["cache_device"],
+                combine_directions_before_linear=adapter_options["combine_directions_before_linear"],
+                block_weight_norm_eps=args.get("block_weight_norm_eps", 1e-6),
+                block_weight_normalization=args.get("block_weight_normalization", "mean_l1"),
+                specific_lora_init_scale=args.get("specific_lora_init_scale", 1e-3),
+                nb_tasks=args.get("nb_tasks", 1),
                 ffn_adapt=True,
                 ffn_option="parallel",
                 ffn_adapter_layernorm_option="none",
@@ -1307,4 +1366,3 @@ class LAE(nn.Module):
     def generate_fc(self, in_dim, out_dim):
         fc = SimpleLinear(in_dim, out_dim)
         return fc
-

@@ -21,7 +21,7 @@ def _KD_loss(pred, soft, T):
 
 
 def compute_orthogonality_loss(previous_weights_list, current_weights, epsilon=1e-8):
-    total_ortho_loss = 0.0
+    total_ortho_loss = current_weights.new_zeros(())
     current_norm = torch.norm(current_weights.flatten())
     current_normalized = current_weights.flatten() / (current_norm + epsilon)
 
@@ -40,6 +40,18 @@ def compute_orthogonality_loss(previous_weights_list, current_weights, epsilon=1
         total_ortho_loss /= len(previous_weights_list)
 
     return total_ortho_loss
+
+
+def compute_optional_orthogonality_loss(previous_weights_list, current_weights, use_orthogonal_constraint, epsilon=1e-8):
+    if current_weights is None:
+        if previous_weights_list:
+            return previous_weights_list[0].detach().new_zeros(())
+        return torch.zeros(())
+    if not use_orthogonal_constraint:
+        return current_weights.detach().new_zeros(())
+    if len(previous_weights_list) == 0:
+        return current_weights.new_zeros(())
+    return compute_orthogonality_loss(previous_weights_list, current_weights, epsilon=epsilon)
 
 class Learner(BaseLearner):
     def __init__(self, args):
@@ -64,6 +76,21 @@ class Learner(BaseLearner):
 
         self.moni_adam = args["moni_adam"]
         self.adapter_num = args["adapter_num"]
+        # use_orth_loss only controls the orthogonality loss; it is fully decoupled
+        # from use_block_weight (block-wise weight). Prefer the nested
+        # task_specific_adapter block, fall back to the legacy flat key.
+        tsa_cfg = args.get("task_specific_adapter", {}) or {}
+        self.use_orthogonal_constraint = bool(
+            tsa_cfg.get("use_orth_loss", args.get("use_orthogonal_constraint", False))
+        )
+        self.orthogonal_lambda = float(args.get("orthogonal_lambda", 0.0))
+        self.args["use_orthogonal_constraint"] = self.use_orthogonal_constraint
+        self.args["orthogonal_lambda"] = self.orthogonal_lambda
+        logging.info(
+            "Orthogonal constraint: enabled=%s lambda=%s",
+            self.use_orthogonal_constraint,
+            self.orthogonal_lambda,
+        )
 
         if self.moni_adam:
             self.use_init_ptm = True
@@ -237,6 +264,8 @@ class Learner(BaseLearner):
         self._network.update_fc(self._total_classes)
 
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
+        if hasattr(self._network.backbone, "log_sd_lora_rr_state"):
+            self._network.backbone.log_sd_lora_rr_state()
 
         self.data_manager = data_manager
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train", )
@@ -326,6 +355,9 @@ class Learner(BaseLearner):
             self._network.train()
 
             losses = 0.0
+            cls_losses = 0.0
+            kd_losses = 0.0
+            orth_losses = 0.0
             correct, total = 0, 0
 
             if not self._network.backbone.msa_adapt:
@@ -352,7 +384,9 @@ class Learner(BaseLearner):
 
                 logits = output["logits"]
 
-                loss = F.cross_entropy(logits, aux_targets)
+                loss_cls = F.cross_entropy(logits, aux_targets)
+                loss = loss_cls
+                loss_kd = logits.new_zeros(())
 
                 if self._cur_task > 0:
                     kd_ratio = 5.
@@ -375,15 +409,25 @@ class Learner(BaseLearner):
                                 temp_weights = 1. * len(temp_weights) * temp_weights / torch.sum(temp_weights)
                                 self._network.backbone.cur_adapter[pos][jj].lora_A.weight.grad = temp_weights.unsqueeze(1) * self._network.backbone.cur_adapter[pos][jj].lora_A.weight.grad
                     optimizer.step()
-                if self._cur_task > 0:
-                    orth_loss_specific = compute_orthogonality_loss(self._network.backbone.block_weight_list, self._network.backbone.block_weight)
-                    loss += 0.0001 * orth_loss_specific
+                orth_loss_specific = logits.new_zeros(())
+                if self._cur_task > 0 and self.use_orthogonal_constraint:
+                    backbone = self._network.backbone
+                    orth_loss_specific = compute_optional_orthogonality_loss(
+                        getattr(backbone, "block_weight_list", []),
+                        getattr(backbone, "block_weight", None),
+                        self.use_orthogonal_constraint,
+                    )
+                    if self.use_orthogonal_constraint and self.orthogonal_lambda != 0.0:
+                        loss = loss + self.orthogonal_lambda * orth_loss_specific
 
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 losses += loss.item()
+                cls_losses += loss_cls.item()
+                kd_losses += loss_kd.item()
+                orth_losses += orth_loss_specific.item()
                 _, preds = torch.max(logits, dim=1)
 
                 correct += preds.eq(aux_targets.expand_as(preds)).cpu().sum()
@@ -393,11 +437,14 @@ class Learner(BaseLearner):
                 scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}".format(
+            info = "Task {}, Epoch {}/{} => Loss {:.3f}, Cls_loss {:.3f}, KD_loss {:.3f}, Orth_loss {:.6f}, Train_accy {:.2f}".format(
                     self._cur_task,
                     epoch + 1,
                     epochs,
                     losses / len(train_loader),
+                    cls_losses / len(train_loader),
+                    kd_losses / len(train_loader),
+                    orth_losses / len(train_loader),
                     train_acc,
                 )
             prog_bar.set_description(info)

@@ -144,7 +144,7 @@ def _train(args):
             forgetting = np.mean((np.max(np_acctable, axis=1) - np_acctable[:, task])[:task])
             print('Accuracy Matrix (NME):')
             print(np_acctable)
-        logging.info('Forgetting (NME): {}'.format(forgetting))
+            logging.info('Forgetting (NME): {}'.format(forgetting))
 
 
 def _set_device(args):

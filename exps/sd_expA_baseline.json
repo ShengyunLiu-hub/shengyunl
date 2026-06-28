@@ -1,22 +1,22 @@
 {
-    "prefix": " ",
-    "dataset": "vtab",
+    "prefix": "sd_expA_baseline_1",
+    "dataset": "cifar224",
     "memory_size": 0,
     "memory_per_class": 0,
     "fixed_memory": false,
-    "shuffle": false,
+    "shuffle": true,
     "init_cls": 10,
     "increment": 10,
     "model_name": "cllora",
     "backbone_type": "vit_base_patch16_224_in21k_cllora",
     "device": ["0"],
     "seed": [1993],
-    
-    "init_epochs": 45,
+
+    "init_epochs": 10,
     "init_lr": 0.03,
-    "later_epochs": 45,
+    "later_epochs": 10,
     "later_lr": 0.03,
-    "batch_size": 32,
+    "batch_size": 64,
     "weight_decay": 0.0001,
     "min_lr": 0,
     "optimizer": "sgd",
@@ -24,7 +24,7 @@
     "pretrained": true,
     "vpt_type": "Deep",
     "prompt_token_num": 5,
-    "ffn_num": 10,
+    "ffn_num": 8,
     "use_diagonal": false,
     "recalc_sim": true,
     "alpha": 0.0,
@@ -36,21 +36,15 @@
     "adapter_num": -1,
     "msa_adapt": true,
     "use_distillation": true,
-    "use_block_weight": true,
-    "use_orthogonal_constraint": false,
     "orthogonal_lambda": 0.0,
-    "direction_scale_init": 0.05,
-    "direction_norm_eps": 0.000001,
     "block_weight_normalization": "mean_l1",
     "block_weight_norm_eps": 0.000001,
     "specific_lora_init_scale": 0.001,
-    "specific_lora_rank_schedule": {
-        "milestones": [0.4, 0.8],
-        "ranks": [8, 6, 4]
-    },
+    "print_forget": true,
+
     "task_specific_adapter": {
         "use_block_weight": true,
-        "use_orth_loss": false
+        "use_orth_loss": true
     },
     "sd_lora": {
         "enable": false,
@@ -64,8 +58,8 @@
         "cache_device": "cuda",
         "combine_directions_before_linear": false
     },
-    "msa":[1,0,1],
-    "general_pos":[0,1,2,3,4,5],
-    "specfic_pos": [6,7,8,9,10,11]
 
+    "msa": [1, 0, 1],
+    "general_pos": [0, 1, 2, 3, 4, 5],
+    "specfic_pos": [6, 7, 8, 9, 10, 11]
 }
