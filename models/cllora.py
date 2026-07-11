@@ -63,21 +63,11 @@ class Learner(BaseLearner):
         self.args = args
         self.batch_size = args["batch_size"]
         self.init_lr = args["init_lr"]
-        self.weight_decay = args["weight_decay"] if args["weight_decay"] is not None else 0.0005
-        self.min_lr = args["min_lr"] if args["min_lr"] is not None else 1e-8
+        self.weight_decay = args["weight_decay"] if args.get("weight_decay") is not None else 0.0005
+        self.min_lr = args.get("min_lr") if args.get("min_lr") is not None else 0
         self.init_cls = args["init_cls"]
         self.inc = args["increment"]
 
-        self.use_exemplars = args["use_old_data"]
-        self.use_init_ptm = args["use_init_ptm"]
-        self.use_diagonal = args["use_diagonal"]
-
-        self.recalc_sim = args["recalc_sim"]
-        self.alpha = args["alpha"] # forward_reweight is divide by _cur_task
-        self.beta = args["beta"]
-
-        self.moni_adam = args["moni_adam"]
-        self.adapter_num = args["adapter_num"]
         # use_orth_loss only controls the orthogonality loss; it is fully decoupled
         # from use_block_weight (block-wise weight). Prefer the nested
         # task_specific_adapter block, fall back to the legacy flat key.
@@ -86,8 +76,6 @@ class Learner(BaseLearner):
             tsa_cfg.get("use_orth_loss", args.get("use_orthogonal_constraint", False))
         )
         self.orthogonal_lambda = float(args.get("orthogonal_lambda", 0.0))
-        self.args["use_orthogonal_constraint"] = self.use_orthogonal_constraint
-        self.args["orthogonal_lambda"] = self.orthogonal_lambda
         # B5: orthogonality between the current SD-LoRA direction and the frozen
         # old directions (the actual task subspaces), as opposed to the legacy
         # block_weight orthogonality above. Off unless direction_orth_lambda > 0.
@@ -101,7 +89,7 @@ class Learner(BaseLearner):
 
         # EWC regularization on the CL-LoRA shared (general_pos) adapters only.
         # Fully decoupled from SD-LoRA-RR, which only touches task-specific
-        # (specfic_pos) adapters.
+        # (specific_pos) adapters.
         self.ewc = SharedAdapterEWC(args)
         if self.ewc.enable:
             self.ewc.log_config()
@@ -116,8 +104,8 @@ class Learner(BaseLearner):
         self.proto_views = int(args.get("proto_views", 1))
 
         calib_cfg = args.get("branch_calibration", {}) or {}
-        self.calib_enable = bool(calib_cfg.get("enable", False))
-        self.calib_scheme = calib_cfg.get("scheme", "pos_zscore")
+        self.calib_enable = bool(calib_cfg.get("enable", True))
+        self.calib_scheme = calib_cfg.get("scheme", "pos_shift")
         self.calib_neg_momentum = float(calib_cfg.get("neg_momentum", 0.5))
         self.calib_eps = float(calib_cfg.get("eps", 1e-6))
         self.dump_eval = bool(calib_cfg.get("dump_eval", False))
@@ -132,9 +120,9 @@ class Learner(BaseLearner):
         # form W = (G + lambda I)^-1 C scores all classes in one shared space,
         # and is (optionally) ensembled with the calibrated diagonal logits.
         ridge_cfg = args.get("ridge_head", {}) or {}
-        self.ridge_enable = bool(ridge_cfg.get("enable", False))
+        self.ridge_enable = bool(ridge_cfg.get("enable", True))
         self.ridge_lambda = float(ridge_cfg.get("lambda", 1.0))
-        self.ridge_weight = float(ridge_cfg.get("ensemble_weight", 0.2))
+        self.ridge_weight = float(ridge_cfg.get("ensemble_weight", 0.15))
         self.ridge_mode = ridge_cfg.get("mode", "ensemble")
         self.ridge_G = None
         self.ridge_C = None
@@ -154,11 +142,6 @@ class Learner(BaseLearner):
                 self.calib_neg_momentum,
                 self.dump_eval,
             )
-
-        if self.moni_adam:
-            self.use_init_ptm = True
-            self.alpha = 1
-            self.beta = 1
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -182,31 +165,13 @@ class Learner(BaseLearner):
 
         return start_cls, end_cls
 
-    def replace_fc_proxy(self):
-        model = self._network
-        model = model.eval()
-        model.fc.weight.data[self._known_classes:self._total_classes, :] = model.proxy_fc.weight.data
-        model.fc.bias.data[self._known_classes:self._total_classes] = model.proxy_fc.bias.data
-
     def replace_fc(self, train_loader):
         model = self._network
         model = model.eval()
 
         with torch.no_grad():
-            # replace proto for each adapter in the current task
-            if self.use_init_ptm:
-                start_idx = -1
-            else:
-                start_idx = 0
-
-            for index in range(start_idx, self._cur_task + 1):
-                if self.moni_adam:
-                    if index > self.adapter_num - 1:
-                        break
-                # only use the diagonal feature, index = -1 denotes using init PTM, index = self._cur_task denotes the last adapter's feature
-                elif self.use_diagonal and index != -1 and index != self._cur_task:
-                    continue
-
+            # replace proto for each adapter branch, current task's data
+            for index in range(0, self._cur_task + 1):
                 loaders = [train_loader]
                 if self.proto_views > 1:
                     # extra passes over the augmented (mode="train") dataset;
@@ -237,10 +202,7 @@ class Learner(BaseLearner):
                     data_index = (label_list == class_index).nonzero().squeeze(-1)
                     embedding = embedding_list[data_index]
                     proto = embedding.mean(0)
-                    if self.use_init_ptm:
-                        model.fc.weight.data[class_index, (index+1)*self._network.out_dim:(index+2)*self._network.out_dim] = proto
-                    else:
-                        model.fc.weight.data[class_index, index*self._network.out_dim:(index+1)*self._network.out_dim] = proto
+                    model.fc.weight.data[class_index, index*self._network.out_dim:(index+1)*self._network.out_dim] = proto
 
                 # B1: collect per-branch calibration stats (and optional dumps)
                 # from the embeddings this loop already computed.
@@ -369,104 +331,6 @@ class Learner(BaseLearner):
                 calibrated[:, start_cls:end_cls] = (outputs[:, start_cls:end_cls] - mu) / denom
         return calibrated
 
-    def get_A_B_Ahat(self, task_id):
-        if self.use_init_ptm:
-            start_dim = (task_id + 1) * self._network.out_dim
-            end_dim = start_dim + self._network.out_dim
-        else:
-            start_dim = task_id * self._network.out_dim
-            end_dim = start_dim + self._network.out_dim
-
-        start_cls, end_cls = self.get_cls_range(task_id)
-
-        # W(Ti)  i is the i-th task index, T is the cur task index, W is a T*T matrix
-        A = self._network.fc.weight.data[self._known_classes:, start_dim : end_dim]
-        #A = self._network.fc.weight.data[0:, start_dim : end_dim]
-        # W(TT)
-        B = self._network.fc.weight.data[self._known_classes:, -self._network.out_dim:]
-        #B = self._network.fc.weight.data[0:, -self._network.out_dim:]
-        # W(ii)
-        A_hat = self._network.fc.weight.data[start_cls : end_cls, start_dim : end_dim]
-
-        return A.cpu(), B.cpu(), A_hat.cpu()
-
-    def solve_similarity(self):
-        for task_id in range(self._cur_task):
-            # print('Solve_similarity adapter:{}'.format(task_id))
-            start_cls, end_cls = self.get_cls_range(task_id=task_id)
-
-            A, B, A_hat = self.get_A_B_Ahat(task_id=task_id)
-
-            # calculate similarity matrix between A_hat(old_cls1) and A(new_cls1).
-            similarity = torch.zeros(len(A_hat), len(A))
-            for i in range(len(A_hat)):
-                for j in range(len(A)):
-                    similarity[i][j] = torch.cosine_similarity(A_hat[i], A[j], dim=0)
-
-            # softmax the similarity, it will be failed if not use it
-            similarity = F.softmax(similarity, dim=1)
-
-            # weight the combination of B(new_cls2)
-            B_hat = torch.zeros(A_hat.shape[0], B.shape[1])
-            for i in range(len(A_hat)):
-                for j in range(len(A)):
-                    B_hat[i] += similarity[i][j] * B[j]
-
-            # B_hat(old_cls2)
-            self._network.fc.weight.data[start_cls : end_cls, -self._network.out_dim:] = B_hat.to(self._device)
-
-    def solve_sim_reset(self):
-        for task_id in range(self._cur_task):
-            if self.moni_adam and task_id > self.adapter_num - 2:
-                break
-
-            if self.use_init_ptm:
-                range_dim = range(task_id + 2, self._cur_task + 2)
-            else:
-                range_dim = range(task_id + 1, self._cur_task + 1)
-            for dim_id in range_dim:
-                if self.moni_adam and dim_id > self.adapter_num:
-                    break
-                # print('Solve_similarity adapter:{}, {}'.format(task_id, dim_id))
-                start_cls, end_cls = self.get_cls_range(task_id=task_id)
-
-                start_dim = dim_id * self._network.out_dim
-                end_dim = (dim_id + 1) * self._network.out_dim
-
-                # Use the element above the diagonal to calculate
-                if self.use_init_ptm:
-                    start_cls_old = self.init_cls + (dim_id - 2) * self.inc
-                    end_cls_old = self._total_classes
-                    start_dim_old = (task_id + 1) * self._network.out_dim
-                    end_dim_old = (task_id + 2) * self._network.out_dim
-                else:
-                    start_cls_old = self.init_cls + (dim_id - 1) * self.inc
-                    end_cls_old = self._total_classes
-                    start_dim_old = task_id * self._network.out_dim
-                    end_dim_old = (task_id + 1) * self._network.out_dim
-
-                A = self._network.fc.weight.data[start_cls_old:end_cls_old, start_dim_old:end_dim_old].cpu()
-                B = self._network.fc.weight.data[start_cls_old:end_cls_old, start_dim:end_dim].cpu()
-                A_hat = self._network.fc.weight.data[start_cls:end_cls, start_dim_old:end_dim_old].cpu()
-
-                # calculate similarity matrix between A_hat(old_cls1) and A(new_cls1).
-                similarity = torch.zeros(len(A_hat), len(A))
-                for i in range(len(A_hat)):
-                    for j in range(len(A)):
-                        similarity[i][j] = torch.cosine_similarity(A_hat[i], A[j], dim=0)
-
-                # softmax the similarity, it will be failed if not use it
-                similarity = F.softmax(similarity, dim=1) # dim=1, not dim=0
-
-                # weight the combination of B(new_cls2)
-                B_hat = torch.zeros(A_hat.shape[0], B.shape[1])
-                for i in range(len(A_hat)):
-                    for j in range(len(A)):
-                        B_hat[i] += similarity[i][j] * B[j]
-
-                # B_hat(old_cls2)
-                self._network.fc.weight.data[start_cls : end_cls, start_dim : end_dim] = B_hat.to(self._device)
-
     def incremental_train(self, data_manager):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
@@ -487,7 +351,6 @@ class Learner(BaseLearner):
         self.train_loader_for_protonet = DataLoader(self.train_dataset_for_protonet, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
 
         if len(self._multiple_gpus) > 1:
-            print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
         self._train(self.train_loader, self.test_loader)
         if len(self._multiple_gpus) > 1:
@@ -549,7 +412,7 @@ class Learner(BaseLearner):
 
     def get_optimizer(self, lr):
         param_groups = self._optimizer_param_groups()
-        if self.args['optimizer'] == 'sgd':
+        if self.args.get('optimizer', 'sgd') == 'sgd':
             optimizer = optim.SGD(
                 param_groups,
                 momentum=0.9,
@@ -569,20 +432,14 @@ class Learner(BaseLearner):
         return optimizer
 
     def get_scheduler(self, optimizer, epoch):
-        if self.args["scheduler"] == 'cosine':
+        if self.args.get("scheduler", "cosine") == 'cosine':
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=epoch, eta_min=self.min_lr)
-        elif self.args["scheduler"] == 'steplr':
-            scheduler = optim.lr_scheduler.MultiStepLR(optimizer=optimizer, milestones=self.args["init_milestones"], gamma=self.args["init_lr_decay"])
         elif self.args["scheduler"] == 'constant':
             scheduler = None
 
         return scheduler
 
     def _init_train(self, train_loader, test_loader, optimizer, scheduler):
-        if self.moni_adam:
-            if self._cur_task > self.adapter_num - 1:
-                return
-
         if self._cur_task == 0 or self.init_cls == self.inc:
             epochs = self.args['init_epochs']
         else:
@@ -604,17 +461,6 @@ class Learner(BaseLearner):
             dir_orth_losses = 0.0
             ewc_losses = 0.0
             correct, total = 0, 0
-
-            if not self._network.backbone.msa_adapt:
-
-                for name, param in self._network.backbone.cur_adapter[0].named_parameters():
-                    print(f"Parameter: {name}, Requires Gradient: {param.requires_grad}")
-            else:
-                for name, param in self._network.backbone.cur_adapter[0][1].named_parameters():
-                    print(f"Parameter: {name}, Requires Gradient: {param.requires_grad}")
-                for name, param in self._network.backbone.cur_adapter[-1][1].named_parameters():
-                    print(f"Parameter: {name}, Requires Gradient: {param.requires_grad}")
-
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self._device), targets.to(self._device)

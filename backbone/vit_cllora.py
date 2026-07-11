@@ -476,14 +476,14 @@ class VisionTransformer(nn.Module):
         if self.msa_adapt:
             self.msa = self.tuning_config.msa
         self.general_pos = self.tuning_config.general_pos
-        self.specfic_pos = self.tuning_config.specfic_pos
+        self.specific_pos = self.tuning_config.specific_pos
         # B7(a): original CL-LoRA inference semantics — every task branch uses
         # the CURRENT shared adapters instead of its per-task snapshot, which
         # lets the shared prefix be computed once per batch (O(l+(N-l)T)).
         self.eval_shared_current = bool(
             getattr(self.tuning_config, "eval_shared_current", False))
 
-        self.adapt_pos = self.general_pos+ self.specfic_pos
+        self.adapt_pos = self.general_pos+ self.specific_pos
         self.adapt_pos = sorted(self.adapt_pos)
 
 
@@ -492,12 +492,12 @@ class VisionTransformer(nn.Module):
 
         if self.use_block_weight:
             self.block_weight_list = nn.ParameterList()
-            self.block_weight = nn.Parameter(torch.randn(3, len(self.specfic_pos)))
+            self.block_weight = nn.Parameter(torch.randn(3, len(self.specific_pos)))
             nn.init.uniform_(self.block_weight, .5, 1.5)
 
         self.direction_scale_list = nn.ParameterList()
         self.direction_scale = nn.Parameter(
-            torch.full((len(self.specfic_pos), 1), self.direction_scale_init),
+            torch.full((len(self.specific_pos), 1), self.direction_scale_init),
             requires_grad=self.sd_lora_enable,
         )
         self.current_specific_rank = self.get_specific_lora_rank(0)
@@ -607,17 +607,17 @@ class VisionTransformer(nn.Module):
 
     def _new_direction_scale(self, previous_scale=None):
         if previous_scale is None:
-            values = torch.full((len(self.specfic_pos), 1), self.direction_scale_init)
+            values = torch.full((len(self.specific_pos), 1), self.direction_scale_init)
         else:
             inherited = previous_scale.detach().clone()
             if inherited.dim() == 1:
-                inherited = inherited.unsqueeze(0).repeat(len(self.specfic_pos), 1)
+                inherited = inherited.unsqueeze(0).repeat(len(self.specific_pos), 1)
             new_value = inherited.new_full((inherited.shape[0], 1), self.direction_scale_init)
             values = torch.cat([inherited, new_value], dim=1)
         return nn.Parameter(values, requires_grad=self.sd_lora_enable)
 
     def _new_block_weight(self):
-        block_weight = nn.Parameter(torch.randn(3, len(self.specfic_pos)))
+        block_weight = nn.Parameter(torch.randn(3, len(self.specific_pos)))
         nn.init.uniform_(block_weight, .5, 1.5)
         return block_weight
 
@@ -652,7 +652,7 @@ class VisionTransformer(nn.Module):
         return nn.Parameter(parameter.detach().clone(), requires_grad=False)
 
     def _set_specific_trainable_state(self):
-        for block_idx in self.specfic_pos:
+        for block_idx in self.specific_pos:
             pos = self.adapt_pos.index(block_idx)
             for adapter in self.cur_adapter[pos]:
                 if getattr(adapter, "is_sd_lora_adapter", False):
@@ -705,7 +705,7 @@ class VisionTransformer(nn.Module):
         adapters = []
         if not self.msa_adapt:
             return adapters
-        for block_idx in self.specfic_pos:
+        for block_idx in self.specific_pos:
             pos = self.adapt_pos.index(block_idx)
             for adapter in self.cur_adapter[pos]:
                 if getattr(adapter, "is_sd_lora_adapter", False):
@@ -767,7 +767,7 @@ class VisionTransformer(nn.Module):
             "dtype: %s\n"
             "requires_grad: %s",
             task_id,
-            len(self.specfic_pos),
+            len(self.specific_pos),
             len(summaries),
             first["shape"],
             first["device"],
@@ -780,8 +780,8 @@ class VisionTransformer(nn.Module):
         current_direction_params = 0
         old_directions_frozen = True
         current_adapter = None
-        if self.msa_adapt and len(self.specfic_pos) > 0:
-            current_adapter = self.cur_adapter[self.adapt_pos.index(self.specfic_pos[0])][0]
+        if self.msa_adapt and len(self.specific_pos) > 0:
+            current_adapter = self.cur_adapter[self.adapt_pos.index(self.specific_pos[0])][0]
             if getattr(current_adapter, "is_sd_lora_adapter", False):
                 direction_ranks = current_adapter.direction_ranks()
                 # parameter count of the newly added (current) direction
@@ -881,7 +881,7 @@ class VisionTransformer(nn.Module):
             self.block_weight = nn.Parameter(torch.zeros_like(state_dict["block_weight"]))
 
         rank_history = None
-        for block_idx in self.specfic_pos:
+        for block_idx in self.specific_pos:
             pos = self.adapt_pos.index(block_idx)
             temp_adapter = nn.ModuleList()
             for msa_idx, msa_enabled in enumerate(self.msa):
@@ -912,7 +912,7 @@ class VisionTransformer(nn.Module):
         self.adapter_list = nn.ModuleList()
         for snapshot_idx in adapter_indices:
             snapshot_adapters = []
-            for spec_idx in range(len(self.specfic_pos)):
+            for spec_idx in range(len(self.specific_pos)):
                 temp_adapter = nn.ModuleList()
                 for msa_idx, msa_enabled in enumerate(self.msa):
                     if msa_enabled == 1:
@@ -939,7 +939,7 @@ class VisionTransformer(nn.Module):
                 for msa_idx, msa_enabled in enumerate(self.msa):
                     if msa_enabled == 1:
                         prefix = "old_adapter_list.{}.{}.{}.".format(snapshot_idx, pos, msa_idx)
-                        if block_idx in self.specfic_pos:
+                        if block_idx in self.specific_pos:
                             ranks = self._direction_ranks_from_state_dict(state_dict, prefix)
                             adapter = self._make_sd_adapter_from_ranks(ranks, trainable_current=False)
                         else:
@@ -1030,7 +1030,7 @@ class VisionTransformer(nn.Module):
                 temp_adapter = nn.ModuleList()
                 for j in self.msa:
                     if j == 1:
-                        if self.adapt_pos[i] in self.specfic_pos and self.sd_lora_enable:
+                        if self.adapt_pos[i] in self.specific_pos and self.sd_lora_enable:
                             adapter = SDLoRAAdapter(self.config,
                                                    rank=self.current_specific_rank,
                                                    dropout=0.0,
@@ -1039,7 +1039,7 @@ class VisionTransformer(nn.Module):
                                                    adapter_layernorm_option=config.ffn_adapter_layernorm_option,
                                                    ).to(self._device)
                         else:
-                            adapter_rank = self.current_specific_rank if self.adapt_pos[i] in self.specfic_pos else config.ffn_num
+                            adapter_rank = self.current_specific_rank if self.adapt_pos[i] in self.specific_pos else config.ffn_num
                             adapter = Adapter_lora(self.config, dropout=0.0, bottleneck=adapter_rank,
                                                     init_option=config.ffn_adapter_init_option,
                                                     adapter_scalar=config.ffn_adapter_scalar,
@@ -1053,15 +1053,12 @@ class VisionTransformer(nn.Module):
             self.cur_adapter.requires_grad_(True)
             self._set_specific_trainable_state()
 
-        else:
-            print("====Not use adapter===")
-
     def get_new_adapter_msa(self):
         config = self.config
 
         if config.ffn_adapt:
-            for i in range(len(self.specfic_pos)):
-                pos = self.adapt_pos.index(self.specfic_pos[i])
+            for i in range(len(self.specific_pos)):
+                pos = self.adapt_pos.index(self.specific_pos[i])
                 temp_adapter = nn.ModuleList()
                 for j in self.msa:
                     if j == 1:
@@ -1093,7 +1090,7 @@ class VisionTransformer(nn.Module):
                     temp_adapter.append(adapter)
                 self.cur_adapter[pos] = temp_adapter
 
-            if len(self.specfic_pos) < 12:
+            if len(self.specific_pos) < 12:
                 self.cur_adapter.requires_grad_(True)
 
                 for i in self.adapt_pos:
@@ -1103,9 +1100,6 @@ class VisionTransformer(nn.Module):
                             if self.msa[j] == 1:
                                 self.cur_adapter[pos][j].lora_B.requires_grad_(False)
                 self._set_specific_trainable_state()
-        else:
-            print("====Not use adapter===")
-
 
     def _drop_snapshot_direction_caches(self, module):
         for submodule in module.modules():
@@ -1115,8 +1109,8 @@ class VisionTransformer(nn.Module):
     def add_adapter_to_list(self):
         completed_task_id = self.current_task_index
         temp_adapter = []
-        for i in range(len(self.specfic_pos)):
-            temp_pos = self.adapt_pos.index(self.specfic_pos[i])
+        for i in range(len(self.specific_pos)):
+            temp_pos = self.adapt_pos.index(self.specific_pos[i])
             temp_adapter.append(copy.deepcopy(self.cur_adapter[temp_pos].requires_grad_(False)))
         self.adapter_list.append(nn.ModuleList(temp_adapter))
         # deepcopy duplicated the [num_old, d, d] direction cache into the
@@ -1147,7 +1141,7 @@ class VisionTransformer(nn.Module):
             # forward_general_cls); the task-specific entries — whose
             # SD-LoRA directions grow with the task count — are dead weight,
             # so keep only the shared entries indexable.
-            for block_index in self.specfic_pos:
+            for block_index in self.specific_pos:
                 snapshot[self.adapt_pos.index(block_index)] = nn.Identity()
             self._drop_snapshot_direction_caches(snapshot)
             self.old_adapter_list.append(snapshot)
@@ -1179,8 +1173,8 @@ class VisionTransformer(nn.Module):
                 if idx in self.adapt_pos:
                     pos = self.adapt_pos.index(idx)
                     block_weight = None
-                    if idx in self.specfic_pos:
-                        pos_spec = self.specfic_pos.index(idx)
+                    if idx in self.specific_pos:
+                        pos_spec = self.specific_pos.index(idx)
                         if self.use_block_weight:
                             block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
                         x = blk(x, self.cur_adapter[pos], prompt, rank_prompt,
@@ -1204,7 +1198,7 @@ class VisionTransformer(nn.Module):
 
         return outcome
 
-    def forward_test(self, x, use_init_ptm=False):
+    def forward_test(self, x):
         B = x.shape[0]
         x = self.patch_embed(x)
 
@@ -1215,12 +1209,6 @@ class VisionTransformer(nn.Module):
 
         features = []
 
-        if use_init_ptm:
-            x = copy.deepcopy(x_init)
-            x = self.blocks(x)
-            x = self.norm(x)
-            features.append(x)
-
         # B7(a) fast path: with eval_shared_current every branch runs the same
         # (current) shared adapters in the prefix blocks, so compute that
         # prefix once per batch instead of once per branch.
@@ -1229,10 +1217,10 @@ class VisionTransformer(nn.Module):
         if (
             self.eval_shared_current
             and self.config.ffn_adapt
-            and len(self.specfic_pos) > 0
-            and (len(self.general_pos) == 0 or max(self.general_pos) < min(self.specfic_pos))
+            and len(self.specific_pos) > 0
+            and (len(self.general_pos) == 0 or max(self.general_pos) < min(self.specific_pos))
         ):
-            prefix_boundary = min(self.specfic_pos)
+            prefix_boundary = min(self.specific_pos)
             xp = x_init
             for j in range(prefix_boundary):
                 if j in self.adapt_pos:
@@ -1257,12 +1245,12 @@ class VisionTransformer(nn.Module):
                             adapt = self._get_general_adapter_for_snapshot(i, j)
                             direction_scale = None
                         else:
-                            pos = self.specfic_pos.index(j)
+                            pos = self.specific_pos.index(j)
                             adapt = self.adapter_list[i][pos]
                             direction_scale = self._inference_direction_scale(i, pos)
 
-                        if self.use_block_weight and j in self.specfic_pos:
-                            pos_spec = self.specfic_pos.index(j)
+                        if self.use_block_weight and j in self.specific_pos:
+                            pos_spec = self.specific_pos.index(j)
                             block_weight = self._get_block_weight_column(self.block_weight_list[i], pos_spec)
                         else:
                             block_weight = None
@@ -1286,8 +1274,8 @@ class VisionTransformer(nn.Module):
                 if i in self.adapt_pos:
                     pos = self.adapt_pos.index(i)
                     adapt = self.cur_adapter[pos]
-                    if i in self.specfic_pos:
-                        pos_spec = self.specfic_pos.index(i)
+                    if i in self.specific_pos:
+                        pos_spec = self.specific_pos.index(i)
                         if self.use_block_weight:
                             block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
                         else:
@@ -1304,13 +1292,13 @@ class VisionTransformer(nn.Module):
 
         return features
 
-    def forward(self, x, test=False, use_init_ptm=False):
+    def forward(self, x, test=False):
         if not test:
             output = self.forward_train(x)
             return output
 
         else:
-            features = self.forward_test(x, use_init_ptm)
+            features = self.forward_test(x)
             output = torch.Tensor().to(features[0].device)
             for x in features:
                 cls = x[:, 0, :]
@@ -1351,11 +1339,11 @@ class VisionTransformer(nn.Module):
                             adapt = self._get_general_adapter_for_snapshot(i, j)
                             direction_scale = None
                         else:
-                            pos = self.specfic_pos.index(j)
+                            pos = self.specific_pos.index(j)
                             adapt = self.adapter_list[i][pos]
                             direction_scale = self._inference_direction_scale(i, pos)
-                        if self.use_block_weight and j in self.specfic_pos:
-                            pos_spec = self.specfic_pos.index(j)
+                        if self.use_block_weight and j in self.specific_pos:
+                            pos_spec = self.specific_pos.index(j)
                             block_weight = self._get_block_weight_column(self.block_weight_list[i], pos_spec)
                         else:
                             block_weight = None
@@ -1371,8 +1359,8 @@ class VisionTransformer(nn.Module):
                     if j in self.adapt_pos:
                         pos = self.adapt_pos.index(j)
                         adapt = self.cur_adapter[pos]
-                        if j in self.specfic_pos:
-                            pos_spec = self.specfic_pos.index(j)
+                        if j in self.specific_pos:
+                            pos_spec = self.specific_pos.index(j)
                             if self.use_block_weight:
                                 block_weight = self._get_block_weight_column(self.block_weight, pos_spec)
                             else:
