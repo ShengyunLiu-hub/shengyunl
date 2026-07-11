@@ -26,6 +26,7 @@
     },
     "ewc": {
         "lambda": 130,
+        "gamma": 0.9,
         "fisher_sample_size": 1024,
         "fisher_batch_size": 32
     }
