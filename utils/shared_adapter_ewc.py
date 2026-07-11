@@ -23,7 +23,7 @@ class SharedAdapterEWC:
 
     def __init__(self, args):
         ewc_cfg = args.get("ewc", {}) or {}
-        self.enable = bool(ewc_cfg.get("enable", False))
+        self.enable = bool(ewc_cfg.get("enable", True))
         self.lam = float(ewc_cfg.get("lambda", 10.0))
         self.gamma = float(ewc_cfg.get("gamma", 1.0))
         self.fisher_sample_size = ewc_cfg.get("fisher_sample_size", None)
