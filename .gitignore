@@ -1,0 +1,15 @@
+# Datasets — download separately, see README (ImageNet data must not be redistributed)
+data/
+
+# Logs and experiment outputs
+logs/
+nohup.out
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Checkpoints / dumps
+*.pth
+*.pt
