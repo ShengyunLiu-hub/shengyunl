@@ -1,9 +1,6 @@
 {
-    "prefix": "vtab7",
+    "prefix": "vtab",
     "dataset": "vtab",
-    "memory_size": 0,
-    "memory_per_class": 0,
-    "fixed_memory": false,
     "shuffle": false,
     "init_cls": 10,
     "increment": 10,
@@ -11,72 +8,25 @@
     "backbone_type": "vit_base_patch16_224_in21k_cllora",
     "device": ["0"],
     "seed": [1993],
-    
     "init_epochs": 45,
     "init_lr": 0.05,
     "later_epochs": 45,
     "later_lr": 0.05,
     "batch_size": 32,
     "weight_decay": 0.0001,
-    "min_lr": 0,
-    "optimizer": "sgd",
-    "scheduler": "cosine",
-    "pretrained": true,
-    "vpt_type": "Deep",
-    "prompt_token_num": 5,
     "ffn_num": 10,
-    "use_diagonal": false,
-    "recalc_sim": true,
-    "alpha": 0.0,
-    "use_init_ptm": false,
-    "beta": 0,
-    "use_old_data": false,
-    "use_reweight": true,
-    "moni_adam": false,
-    "adapter_num": -1,
-    "msa_adapt": true,
-    "use_distillation": true,
-    "use_block_weight": true,
-    "use_orthogonal_constraint": false,
-    "orthogonal_lambda": 0.0,
-    "direction_scale_init": 0.3,
-    "block_weight_normalization": "mean_l1",
-    "block_weight_norm_eps": 0.000001,
     "specific_lora_init_scale": 0.03,
-    "print_forget": true,
-    
     "task_specific_adapter": {
-        "use_block_weight": true,
         "use_orth_loss": false
     },
     "sd_lora": {
-        "enable": true,
-        "variant": "rr",
         "r0": 10,
         "r_min": 6,
-        "rank_decay": 0.9,
-        "normalize_direction": true,
-        "direction_norm_eps": 0.000001,
-        "alpha_mode": "task_conditioned",
-        "train_old_alpha": false,
-        "alpha_init": 0.8,
-        "cache_old_directions": true,
-        "cache_device": "cuda",
-        "combine_directions_before_linear": true
+        "alpha_init": 0.8
     },
     "ewc": {
-        "enable": true,
         "lambda": 200,
-        "gamma": 1.0,
         "fisher_sample_size": 1024,
-        "fisher_batch_size": 32,
-        "fisher_on_shared_adapter_only": true,
-        "fisher_use_ce_only": true,
-        "store_full_delta_fisher": true,
-        "normalize_fisher": false
-    },
-    "msa":[1,0,1],
-    "general_pos":[0,1,2,3,4,5],
-    "specfic_pos": [6,7,8,9,10,11]
-
+        "fisher_batch_size": 32
+    }
 }

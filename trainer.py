@@ -124,7 +124,7 @@ def _train(args):
     # print ('--+--+---+---+---total time is --+--+---+---+---')
     # print (total_time)
 
-    if 'print_forget' in args.keys() and args['print_forget'] is True:
+    if args.get('print_forget', True) is True:
         if len(cnn_matrix) > 0:
             np_acctable = np.zeros([task + 1, task + 1])
             for idxx, line in enumerate(cnn_matrix):
