@@ -57,8 +57,19 @@
         "cache_device": "cuda",
         "combine_directions_before_linear": false
     },
+    "ewc": {
+        "enable": false,
+        "lambda": 100,
+        "gamma": 1.0,
+        "fisher_sample_size": 1024,
+        "fisher_batch_size": 64,
+        "fisher_on_shared_adapter_only": true,
+        "fisher_use_ce_only": true,
+        "store_full_delta_fisher": true,
+        "normalize_fisher": false
+    },
 
-    "msa": [1, 0, 1],
+        "msa": [1, 0, 1],
     "general_pos": [0, 1, 2, 3, 4, 5],
     "specfic_pos": [6, 7, 8, 9, 10, 11]
 }

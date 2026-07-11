@@ -1,5 +1,5 @@
 {
-    "prefix": " ",
+    "prefix": "vtab7",
     "dataset": "vtab",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -13,9 +13,9 @@
     "seed": [1993],
     
     "init_epochs": 45,
-    "init_lr": 0.03,
+    "init_lr": 0.05,
     "later_epochs": 45,
-    "later_lr": 0.03,
+    "later_lr": 0.05,
     "batch_size": 32,
     "weight_decay": 0.0001,
     "min_lr": 0,
@@ -39,30 +39,41 @@
     "use_block_weight": true,
     "use_orthogonal_constraint": false,
     "orthogonal_lambda": 0.0,
-    "direction_scale_init": 0.05,
-    "direction_norm_eps": 0.000001,
+    "direction_scale_init": 0.3,
     "block_weight_normalization": "mean_l1",
     "block_weight_norm_eps": 0.000001,
-    "specific_lora_init_scale": 0.001,
-    "specific_lora_rank_schedule": {
-        "milestones": [0.4, 0.8],
-        "ranks": [8, 6, 4]
-    },
+    "specific_lora_init_scale": 0.03,
+    "print_forget": true,
+    
     "task_specific_adapter": {
         "use_block_weight": true,
         "use_orth_loss": false
     },
     "sd_lora": {
-        "enable": false,
-        "variant": "fixed",
-        "r0": 8,
-        "normalize_direction": false,
+        "enable": true,
+        "variant": "rr",
+        "r0": 10,
+        "r_min": 6,
+        "rank_decay": 0.9,
+        "normalize_direction": true,
+        "direction_norm_eps": 0.000001,
         "alpha_mode": "task_conditioned",
         "train_old_alpha": false,
-        "alpha_init": 1.0,
+        "alpha_init": 0.8,
         "cache_old_directions": true,
         "cache_device": "cuda",
-        "combine_directions_before_linear": false
+        "combine_directions_before_linear": true
+    },
+    "ewc": {
+        "enable": true,
+        "lambda": 200,
+        "gamma": 1.0,
+        "fisher_sample_size": 1024,
+        "fisher_batch_size": 32,
+        "fisher_on_shared_adapter_only": true,
+        "fisher_use_ce_only": true,
+        "store_full_delta_fisher": true,
+        "normalize_fisher": false
     },
     "msa":[1,0,1],
     "general_pos":[0,1,2,3,4,5],

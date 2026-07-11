@@ -1,0 +1,110 @@
+{
+  "prefix": "b8_rrdecay08_e10",
+  "dataset": "cifar224",
+  "memory_size": 0,
+  "memory_per_class": 0,
+  "fixed_memory": false,
+  "shuffle": true,
+  "init_cls": 5,
+  "increment": 5,
+  "model_name": "cllora",
+  "backbone_type": "vit_base_patch16_224_in21k_cllora",
+  "device": [
+    "0"
+  ],
+  "seed": [
+    1993
+  ],
+  "init_epochs": 10,
+  "init_lr": 0.05,
+  "later_epochs": 10,
+  "later_lr": 0.05,
+  "batch_size": 64,
+  "weight_decay": 0.0001,
+  "min_lr": 0,
+  "optimizer": "sgd",
+  "scheduler": "cosine",
+  "pretrained": true,
+  "vpt_type": "Deep",
+  "prompt_token_num": 5,
+  "ffn_num": 8,
+  "use_diagonal": false,
+  "recalc_sim": true,
+  "alpha": 0.0,
+  "use_init_ptm": false,
+  "beta": 0,
+  "use_old_data": false,
+  "use_reweight": true,
+  "moni_adam": false,
+  "adapter_num": -1,
+  "msa_adapt": true,
+  "use_distillation": true,
+  "orthogonal_lambda": 0.0,
+  "block_weight_normalization": "mean_l1",
+  "block_weight_norm_eps": 1e-06,
+  "specific_lora_init_scale": 0.005,
+  "print_forget": true,
+  "task_specific_adapter": {
+    "use_block_weight": true,
+    "use_orth_loss": true
+  },
+  "sd_lora": {
+    "enable": true,
+    "variant": "rr",
+    "r0": 8,
+    "r_min": 4,
+    "rank_decay": 0.8,
+    "normalize_direction": true,
+    "direction_norm_eps": 1e-05,
+    "alpha_mode": "task_conditioned",
+    "train_old_alpha": false,
+    "alpha_init": 0.1,
+    "cache_old_directions": true,
+    "cache_device": "cuda",
+    "combine_directions_before_linear": true
+  },
+  "ewc": {
+    "enable": true,
+    "lambda": 180,
+    "gamma": 1.0,
+    "fisher_sample_size": 1024,
+    "fisher_batch_size": 64,
+    "fisher_on_shared_adapter_only": true,
+    "fisher_use_ce_only": true,
+    "store_full_delta_fisher": true,
+    "normalize_fisher": false
+  },
+  "msa": [
+    1,
+    0,
+    1
+  ],
+  "general_pos": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "specfic_pos": [
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "branch_calibration": {
+    "enable": true,
+    "scheme": "pos_shift",
+    "neg_momentum": 0.5,
+    "dump_eval": true
+  },
+  "ridge_head": {
+    "enable": true,
+    "lambda": 1.0,
+    "ensemble_weight": 0.2,
+    "mode": "ensemble"
+  }
+}

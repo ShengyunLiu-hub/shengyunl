@@ -1,5 +1,5 @@
 {
-    "prefix": "ina4",
+    "prefix": "vram_smoke_ina",
     "dataset": "imageneta",
     "memory_size": 0,
     "memory_per_class": 0,
@@ -9,12 +9,15 @@
     "increment": 20,
     "model_name": "cllora",
     "backbone_type": "vit_base_patch16_224_in21k_cllora",
-    "device": ["0"],
-    "seed": [1993],
-    
-    "init_epochs": 25,
+    "device": [
+        "0"
+    ],
+    "seed": [
+        1993
+    ],
+    "init_epochs": 1,
     "init_lr": 0.05,
-    "later_epochs": 25,
+    "later_epochs": 1,
     "later_lr": 0.05,
     "batch_size": 32,
     "weight_decay": 0.005,
@@ -41,7 +44,7 @@
     "orthogonal_lambda": 0.0,
     "direction_scale_init": 0.05,
     "block_weight_normalization": "mean_l1",
-    "block_weight_norm_eps": 0.000001,
+    "block_weight_norm_eps": 1e-06,
     "specific_lora_init_scale": 0.001,
     "print_forget": true,
     "task_specific_adapter": {
@@ -55,7 +58,7 @@
         "r_min": 7,
         "rank_decay": 0.9,
         "normalize_direction": true,
-        "direction_norm_eps": 0.000001,
+        "direction_norm_eps": 1e-06,
         "alpha_mode": "task_conditioned",
         "train_old_alpha": false,
         "alpha_init": 0.13,
@@ -74,7 +77,37 @@
         "store_full_delta_fisher": true,
         "normalize_fisher": false
     },
-    "msa":[1,0,1],
-    "general_pos":[0,1,2,3,4,5],
-    "specfic_pos": [6,7,8,9,10,11]
+    "msa": [
+        1,
+        0,
+        1
+    ],
+    "general_pos": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+    ],
+    "specfic_pos": [
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+    ],
+    "branch_calibration": {
+        "enable": true,
+        "scheme": "pos_shift",
+        "neg_momentum": 0.5,
+        "dump_eval": false
+    },
+    "ridge_head": {
+        "enable": true,
+        "lambda": 1.0,
+        "ensemble_weight": 0.2,
+        "mode": "ensemble"
+    }
 }

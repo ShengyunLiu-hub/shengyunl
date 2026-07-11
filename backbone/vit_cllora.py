@@ -39,6 +39,15 @@ class Adapter_lora(nn.Module):
         self.lora_A = nn.Linear(self.down_size, self.n_embd, bias=False)
         self.lora_B = nn.Linear(self.n_embd, self.down_size, bias=False)
 
+        # ---- EWC (shared-adapter) Fisher estimation hooks ----
+        # When ewc_fisher_mode is True, forward builds the full update
+        # delta_w = A_s @ B_s, calls retain_grad on it, and routes the forward
+        # through it so that delta_w.grad gives d(CE)/d(Delta_W_s). These are
+        # only used during SharedAdapterEWC.estimate_fisher and never register
+        # delta_w as a trainable parameter.
+        self.ewc_fisher_mode = False
+        self.ewc_delta_w = None
+
         if self.random_orth:
             random_matrix = torch.rand(self.n_embd, self.down_size)
             q, r = torch.linalg.qr(random_matrix)
@@ -59,6 +68,16 @@ class Adapter_lora(nn.Module):
             raise NotImplementedError
 
     def forward(self, x):
+        if self.ewc_fisher_mode:
+            # Build the full low-rank update delta_w = A_s @ B_s in the
+            # [n_embd, n_embd] space and route the forward through it so the
+            # diagonal Fisher can be read from delta_w.grad. lora_A is trainable
+            # and lora_B is frozen, so gradients still flow back to A_s.
+            delta_w = self.lora_A.weight @ self.lora_B.weight  # [n_embd, n_embd]
+            delta_w.retain_grad()
+            self.ewc_delta_w = delta_w
+            out = F.linear(x, delta_w)  # x @ delta_w^T == lora_A(lora_B(x))
+            return out
         inter_x = self.lora_B(x)
         out = self.lora_A(inter_x)
         return out
@@ -139,6 +158,18 @@ class SDLoRAAdapter(nn.Module):
         self.cached_old_direction_weights = torch.empty(0, device=device, dtype=dtype)
         self._cached_old_direction_count = 0
         self._cache_warning_emitted.clear()
+
+    def drop_direction_cache(self):
+        """Free the normalized-direction cache on a frozen snapshot adapter.
+
+        Snapshots in adapter_list / old_adapter_list are deep copies and would
+        otherwise each carry a full [num_old, d, d] cache copy -> O(T^2) GPU
+        memory across tasks. After dropping, forward falls back to recomputing
+        normalize(A@B) on the fly, which is numerically identical (the cache
+        stored exactly that) and cheap. The fallback warning is pre-silenced
+        because the fallback is intentional here."""
+        self.clear_cached_old_directions()
+        self._cache_warning_emitted.update(range(len(self.directions)))
 
     def _cache_target_device(self):
         parameter_device = next(self.parameters()).device
@@ -236,6 +267,31 @@ class SDLoRAAdapter(nn.Module):
             device=x.device,
             dtype=x.dtype,
         )
+
+    def orthogonality_loss(self):
+        """|<D_t_hat, D_k_hat>_F| between the current (trainable) direction and
+        every frozen old direction, averaged. Directions are Frobenius-normalized,
+        so each term lies in [0, 1]. Returns None when there is no old direction.
+
+        Old directions come from cached_old_direction_weights when available
+        (already normalized + detached); otherwise they are recomputed without
+        grad. Only the current direction receives gradient."""
+        if len(self.directions) < 2:
+            return None
+        current_weight = self._normalized_direction_weight(self.directions[-1])
+        total = None
+        num_old = len(self.directions) - 1
+        for k in range(num_old):
+            if self.cached_old_direction_weights.numel() > 0 and k < self.num_cached_directions():
+                old_weight = self.cached_old_direction_weights[k].to(
+                    device=current_weight.device, dtype=current_weight.dtype
+                )
+            else:
+                with torch.no_grad():
+                    old_weight = self._normalized_direction_weight(self.directions[k]).detach()
+            dot = torch.abs((current_weight * old_weight).sum())
+            total = dot if total is None else total + dot
+        return total / num_old
 
     def forward(self, x, direction_scale):
         if direction_scale is None:
@@ -421,6 +477,11 @@ class VisionTransformer(nn.Module):
             self.msa = self.tuning_config.msa
         self.general_pos = self.tuning_config.general_pos
         self.specfic_pos = self.tuning_config.specfic_pos
+        # B7(a): original CL-LoRA inference semantics — every task branch uses
+        # the CURRENT shared adapters instead of its per-task snapshot, which
+        # lets the shared prefix be computed once per batch (O(l+(N-l)T)).
+        self.eval_shared_current = bool(
+            getattr(self.tuning_config, "eval_shared_current", False))
 
         self.adapt_pos = self.general_pos+ self.specfic_pos
         self.adapt_pos = sorted(self.adapt_pos)
@@ -634,6 +695,8 @@ class VisionTransformer(nn.Module):
 
     def _get_general_adapter_for_snapshot(self, task_index, block_index):
         pos = self.adapt_pos.index(block_index)
+        if self.eval_shared_current:
+            return self.cur_adapter[pos]
         if self.use_distillation and task_index < len(self.old_adapter_list):
             return self.old_adapter_list[task_index][pos]
         return self.cur_adapter[pos]
@@ -648,6 +711,19 @@ class VisionTransformer(nn.Module):
                 if getattr(adapter, "is_sd_lora_adapter", False):
                     adapters.append(adapter)
         return adapters
+
+    def sd_lora_direction_orth_loss(self):
+        """Mean orthogonality loss of the current SD-LoRA direction against all
+        frozen old directions, over every task-specific adapter. None if no old
+        directions exist yet (e.g. task 0)."""
+        losses = []
+        for adapter in self._current_sd_lora_adapters():
+            adapter_loss = adapter.orthogonality_loss()
+            if adapter_loss is not None:
+                losses.append(adapter_loss)
+        if len(losses) == 0:
+            return None
+        return torch.stack(losses).mean()
 
     def cache_current_old_directions(self):
         if not self.sd_lora_enable or not self.cache_old_directions:
@@ -1031,6 +1107,11 @@ class VisionTransformer(nn.Module):
             print("====Not use adapter===")
 
 
+    def _drop_snapshot_direction_caches(self, module):
+        for submodule in module.modules():
+            if getattr(submodule, "is_sd_lora_adapter", False):
+                submodule.drop_direction_cache()
+
     def add_adapter_to_list(self):
         completed_task_id = self.current_task_index
         temp_adapter = []
@@ -1038,6 +1119,10 @@ class VisionTransformer(nn.Module):
             temp_pos = self.adapt_pos.index(self.specfic_pos[i])
             temp_adapter.append(copy.deepcopy(self.cur_adapter[temp_pos].requires_grad_(False)))
         self.adapter_list.append(nn.ModuleList(temp_adapter))
+        # deepcopy duplicated the [num_old, d, d] direction cache into the
+        # snapshot -> O(T^2) GPU memory across tasks; drop it (fallback is
+        # numerically identical).
+        self._drop_snapshot_direction_caches(self.adapter_list[-1])
 
         if self.use_block_weight:
             self.block_weight_list.append(self._snapshot_parameter(self.block_weight))
@@ -1056,7 +1141,16 @@ class VisionTransformer(nn.Module):
         self.adapter_pos_list.append(self.adapt_pos)
 
         if self.use_distillation:
-            self.old_adapter_list.append(copy.deepcopy(self.cur_adapter).requires_grad_(False))
+            snapshot = copy.deepcopy(self.cur_adapter).requires_grad_(False)
+            # KD/inference only ever read the general_pos (shared) entries of
+            # old_adapter_list (see _get_general_adapter_for_snapshot /
+            # forward_general_cls); the task-specific entries — whose
+            # SD-LoRA directions grow with the task count — are dead weight,
+            # so keep only the shared entries indexable.
+            for block_index in self.specfic_pos:
+                snapshot[self.adapt_pos.index(block_index)] = nn.Identity()
+            self._drop_snapshot_direction_caches(snapshot)
+            self.old_adapter_list.append(snapshot)
         if self.msa_adapt:
             self.get_new_adapter_msa()
         self._apply_alpha_mode_requires_grad()
@@ -1126,10 +1220,34 @@ class VisionTransformer(nn.Module):
             x = self.blocks(x)
             x = self.norm(x)
             features.append(x)
+
+        # B7(a) fast path: with eval_shared_current every branch runs the same
+        # (current) shared adapters in the prefix blocks, so compute that
+        # prefix once per batch instead of once per branch.
+        shared_prefix_x = None
+        prefix_boundary = 0
+        if (
+            self.eval_shared_current
+            and self.config.ffn_adapt
+            and len(self.specfic_pos) > 0
+            and (len(self.general_pos) == 0 or max(self.general_pos) < min(self.specfic_pos))
+        ):
+            prefix_boundary = min(self.specfic_pos)
+            xp = x_init
+            for j in range(prefix_boundary):
+                if j in self.adapt_pos:
+                    xp = self.blocks[j](xp, self.cur_adapter[self.adapt_pos.index(j)])
+                else:
+                    xp = self.blocks[j](xp, adapt=None, prompt=None, rank_prompt=None, block_weight=None)
+            shared_prefix_x = xp
+
         if self.config.ffn_adapt:
             for i in range(len(self.adapter_list)):
-                x = copy.deepcopy(x_init)
-                for j in range(len(self.blocks)):
+                if shared_prefix_x is not None:
+                    x = shared_prefix_x
+                else:
+                    x = copy.deepcopy(x_init)
+                for j in range(prefix_boundary, len(self.blocks)):
 
                     rank_prompt = None
                     prompt = None
@@ -1156,8 +1274,11 @@ class VisionTransformer(nn.Module):
                 x = self.norm(x)
                 features.append(x)
 
-            x = copy.deepcopy(x_init)
-            for i in range(len(self.blocks)):
+            if shared_prefix_x is not None:
+                x = shared_prefix_x
+            else:
+                x = copy.deepcopy(x_init)
+            for i in range(prefix_boundary, len(self.blocks)):
 
                 rank_prompt = None
                 prompt = None

@@ -273,6 +273,7 @@ def get_backbone(args, pretrained=False):
                 block_weight_normalization=args.get("block_weight_normalization", "mean_l1"),
                 specific_lora_init_scale=args.get("specific_lora_init_scale", 1e-3),
                 nb_tasks=args.get("nb_tasks", 1),
+                eval_shared_current=args.get("eval_shared_current", False),
                 ffn_adapt=True,
                 ffn_option="parallel",
                 ffn_adapter_layernorm_option="none",
