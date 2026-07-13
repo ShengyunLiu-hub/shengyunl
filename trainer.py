@@ -39,6 +39,10 @@ def _train(args):
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(filename)s] => %(message)s",
+        # force=True: basicConfig is a no-op once the root logger has handlers,
+        # so without it every seed after the first logs into the first seed's
+        # file and its own file stays empty.
+        force=True,
         handlers=[
             logging.FileHandler(filename=logfilename + ".log"),
             logging.StreamHandler(sys.stdout),
