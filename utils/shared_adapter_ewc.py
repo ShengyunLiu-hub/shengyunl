@@ -32,6 +32,13 @@ class SharedAdapterEWC:
         self.fisher_use_ce_only = bool(ewc_cfg.get("fisher_use_ce_only", True))
         self.store_full_delta_fisher = bool(ewc_cfg.get("store_full_delta_fisher", True))
         self.normalize_fisher = bool(ewc_cfg.get("normalize_fisher", False))
+        # Cap on cumulative Fisher entries. A single-task gradient spike enters
+        # F_cum undecayed (gamma only shrinks the old accumulation), and once
+        # lam * lr * F_cum_max crosses the gradient-descent stability threshold
+        # the next task diverges in epoch 1 (seen on ina seed 3: fisher_max 6.49
+        # at task 8 vs <=1.0 on clean seeds). None disables clipping.
+        clip = ewc_cfg.get("fisher_clip", None)
+        self.fisher_clip = float(clip) if clip is not None else None
 
         self.device = args["device"][0]
 
@@ -180,12 +187,14 @@ class SharedAdapterEWC:
         return fisher_cur, sample_count, n_batches
 
     def update_fisher(self, fisher_cur):
-        """Accumulate Fisher:  F_cum = gamma * F_cum + F_t."""
+        """Accumulate Fisher:  F_cum = clamp(gamma * F_cum + F_t, max=fisher_clip)."""
         for key, f in fisher_cur.items():
             if key in self.fisher_cum:
                 self.fisher_cum[key] = self.gamma * self.fisher_cum[key] + f
             else:
                 self.fisher_cum[key] = f.clone()
+            if self.fisher_clip is not None:
+                self.fisher_cum[key].clamp_(max=self.fisher_clip)
 
     def save_reference(self, backbone):
         """Save A_s_ref <- stopgrad(A_s) as a detached clone (no graph)."""
@@ -199,6 +208,7 @@ class SharedAdapterEWC:
         logging.info("EWC enabled: {}".format(self.enable))
         logging.info("EWC lambda: {}".format(self.lam))
         logging.info("EWC gamma: {}".format(self.gamma))
+        logging.info("EWC fisher_clip: {}".format(self.fisher_clip))
 
     def log_param_check(self, backbone):
         shared_A_trainable = None

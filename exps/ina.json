@@ -6,8 +6,12 @@
     "increment": 20,
     "model_name": "cllora",
     "backbone_type": "vit_base_patch16_224_in21k_cllora",
-    "device": ["0"],
-    "seed": [1993],
+    "device": [
+        "0"
+    ],
+    "seed": [
+        1993
+    ],
     "init_epochs": 25,
     "init_lr": 0.05,
     "later_epochs": 25,
@@ -28,6 +32,7 @@
         "lambda": 130,
         "gamma": 0.9,
         "fisher_sample_size": 1024,
-        "fisher_batch_size": 32
+        "fisher_batch_size": 32,
+        "fisher_clip": 2.0
     }
 }
