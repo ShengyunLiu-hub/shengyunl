@@ -18,8 +18,11 @@ This repository extends [CL-LoRA (CVPR 2025)](https://openaccess.thecvf.com/cont
 ```bash
 conda create -n cl_lora python=3.9
 conda activate cl_lora
-pip install torch==2.0.1 torchvision==0.15.2 timm==0.6.12 numpy scikit-learn easydict tqdm
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118
 ```
+
+`requirements.txt` pins the exact versions all reported numbers were produced with
+(torch 2.0.1 + cu118).
 
 The ViT-B/16 (IN21k) backbone weights are downloaded automatically by `timm`.
 
@@ -69,7 +72,54 @@ Logs (accuracy curve, forgetting matrix, task-id routing accuracy) are written t
 ¹ collected at `ensemble_weight = 0.2`; the offline sweep predicts 93.94 at `w = 0.15` (run-to-run noise is ±0.35).
 ² after the per-task `torch.cuda.empty_cache()` fix; training is not bit-deterministic across GPUs/driver versions, so expect small deviations.
 
-Note for ImageNet-R (40 tasks): `ewc.gamma = 0.9` is required — with `gamma = 1.0` the accumulated Fisher grows unboundedly and training diverges around task 37.
+### EWC stability notes (long task sequences)
+
+Two independent failure modes of Fisher accumulation showed up across our
+multi-seed runs; the released configs guard against both:
+
+- **Accumulation-driven divergence** (`ewc.gamma`): with `gamma = 1.0` the
+  accumulated Fisher grows unboundedly — ImageNet-R (40 tasks) diverges around
+  task 37, ImageNet-A at some seeds. All released configs use `gamma = 0.9`.
+- **Spike-driven divergence** (`ewc.fisher_clip`): occasionally a single task
+  produces a catastrophic Fisher estimate (per-task `fisher_max` jumping ~10×,
+  e.g. ImageNet-A seed 3, ImageNet-R seed 6), which `gamma` cannot fix.
+  `fisher_clip: 2.0` (entry-wise cap on the accumulated Fisher, in
+  `exps/ina.json` and `exps/inr.json`) is a no-op for well-behaved runs and
+  prevents the blow-up on the affected seeds.
+
+## Reproducing the multi-seed paired tables
+
+The paper's tables report mean±std over 10 seeds `[1993, 1994, 1995, 0, 1, 2, 3, 4, 5, 6]`
+(5 seeds `[1993, 1994, 1995, 0, 1]` for the EWC-LoRA-protocol table) with a
+**paired design**: per seed we train ONE model with the release config plus
+
+```jsonc
+"seed": [<seed>],
+"branch_calibration": {"dump_eval": true}   // per-task eval dumps
+```
+
+and recover both table rows offline from the same dump — no second training run:
+
+```bash
+# base  = scheme none,      w = 0.00  (ensemble off, raw diagonal head)
+# ours  = scheme pos_shift, w = 0.15  (released inference configuration)
+python tools/sweep_ensemble.py logs/cllora/<ds-path>/analysis_<run-prefix>_<seed> --weights 0.0 0.15
+python tools/build_paired_table.py --metric avg    # aggregates all sweeps into the paired table
+python tools/build_paired_table.py --metric final
+```
+
+The offline `pos_shift w=0.15` numbers exactly match the ensemble accuracy the
+run itself logs (cross-checked on every run), so `base` and `ours` are perfectly
+paired within each seed.
+
+For the EWC-LoRA-protocol cells (T=10), change only the task split in the
+release config: CIFAR-100 `"init_cls": 10, "increment": 10`; ImageNet-R
+`"init_cls": 20, "increment": 20`.
+
+Figure scripts (`tools/paper_figs.py`, `tools/fig_routing.py`) redraw all paper
+figures from the sweep outputs and eval dumps; `tools/paired_forgetting.py` and
+`tools/param_stats.py` aggregate the forgetting and trainable-parameter columns
+from the run logs.
 
 ## Ablations
 

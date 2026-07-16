@@ -1,0 +1,13 @@
+# Python 3.9; versions pinned to the environment all reported results were run in.
+# torch/torchvision built against CUDA 11.8 (pip: --index-url https://download.pytorch.org/whl/cu118)
+torch==2.0.1
+torchvision==0.15.2
+timm==0.6.12
+numpy==1.25.2
+scikit-learn==1.2.0
+scipy==1.13.1
+easydict==1.13
+tqdm==4.67.3
+pillow==11.3.0
+# figures only (tools/paper_figs.py, tools/fig_routing.py)
+matplotlib==3.9.4
