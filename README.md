@@ -56,21 +56,25 @@ Logs (accuracy curve, forgetting matrix, task-id routing accuracy) are written t
 - `general_pos = [0..5]`: task-shared LoRA in the first 6 ViT blocks
 - `specific_pos = [6..11]`: task-specific LoRA in the last 6 ViT blocks
 
-## Expected results (seed 1993, single run)
+## Expected results (10 seeds, mean±std)
 
-`Base` = same training, inference with the raw diagonal head only
-(`"branch_calibration": {"enable": false}, "ridge_head": {"enable": false}`).
-`Ours` = the released configs (calibration + ridge ensemble, `w = 0.15`).
+Seeds `[1993, 1994, 1995, 0, 1, 2, 3, 4, 5, 6]`, paired protocol (see next
+section): per seed ONE model is trained with the release config; `Base` is the
+same model evaluated with the ensemble off (raw diagonal head only), `Ours`
+is the released inference path (calibration + ridge ensemble, `w = 0.15`).
 
 | Benchmark | Base avg / final / forgetting | Ours avg / final / forgetting | Peak VRAM |
 |---|---|---|---|
-| CIFAR-100 (5×20) | 92.39 / 87.49 / 6.09 | **93.98 / 90.08 / 4.04** ¹ | 11.5 GB |
-| ImageNet-A (20×10) | 69.50 / 59.38 / 9.89 | **72.44 / 62.01 / 10.18** | 6.1 GB |
-| ImageNet-R (5×40) | 80.69 / 72.72 / 6.62 | **83.53 / 76.47 / 7.01** | ≤9.4 GB ² |
-| VTAB (10×5) | 94.71 / 93.51 / 0.95 | **95.21 / 94.64 / 0.89** | 5.8 GB |
+| CIFAR-100 (5×20) | 91.64±0.64 / 86.53±0.43 / 6.52±0.93 | **93.72±0.41 / 89.95±0.31 / 4.19±0.33** | 11.5 GB |
+| ImageNet-A (20×10) | 67.41±1.50 / 57.24±1.00 / 9.18±0.98 | **70.34±1.56 / 60.94±1.04 / 9.13±0.93** | 6.1 GB |
+| ImageNet-R (5×40) | 80.05±0.76 / 72.44±0.88 / 7.93±1.46 | **82.83±0.61 / 76.13±0.35 / 6.83±0.43** | ≤9.4 GB ¹ |
+| VTAB (10×5) | 94.57±0.45 / 93.67±0.80 / 0.81±0.19 | **95.09±0.29 / 94.64±0.43 / 0.63±0.16** | 5.8 GB |
 
-¹ collected at `ensemble_weight = 0.2`; the offline sweep predicts 93.94 at `w = 0.15` (run-to-run noise is ±0.35).
-² after the per-task `torch.cuda.empty_cache()` fix; training is not bit-deterministic across GPUs/driver versions, so expect small deviations.
+The paired per-seed gain is far tighter than the seed-to-seed spread
+(avg-accuracy gain: CIFAR +2.08±0.46, ImageNet-R +2.78±0.42, ImageNet-A
++2.94±0.42, VTAB +0.52±0.23; every one of the 40 seed-pairs is positive).
+
+¹ after the per-task `torch.cuda.empty_cache()` fix; training is not bit-deterministic across GPUs/driver versions, so expect small deviations.
 
 ### EWC stability notes (long task sequences)
 
